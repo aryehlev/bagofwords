@@ -1841,7 +1841,7 @@ class AgentV2:
             # Use cached schemas from prime_static() - no duplicate build
             schemas_ctx = view.static.schemas
             try:
-                schemas_excerpt = schemas_ctx.render_combined(top_k_per_ds=self.top_k_schema, index_limit=INDEX_LIMIT) if schemas_ctx else ""
+                schemas_excerpt = schemas_ctx.render_combined(top_k_per_ds=self.top_k_schema, index_limit=INDEX_LIMIT, stable=True) if schemas_ctx else ""
             except Exception:
                 schemas_excerpt = schemas_ctx.render() if schemas_ctx else ""
             _mlog(f"schemas_rendered len={len(schemas_excerpt)}")
@@ -3505,7 +3505,7 @@ class AgentV2:
             schemas_ctx = await self.context_hub.schema_builder.build(
                 with_stats=True,
             )
-            schemas_combined = schemas_ctx.render_combined(top_k_per_ds=self.top_k_schema, index_limit=INDEX_LIMIT)
+            schemas_combined = schemas_ctx.render_combined(top_k_per_ds=self.top_k_schema, index_limit=INDEX_LIMIT, stable=True)
         except Exception:
             schemas_combined = view.static.schemas.render() if getattr(view.static, "schemas", None) else ""
 
