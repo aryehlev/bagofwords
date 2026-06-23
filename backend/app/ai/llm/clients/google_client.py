@@ -1,11 +1,17 @@
+import asyncio
 import base64
+import hashlib
 import json
+import os
+import time
 from typing import AsyncGenerator, AsyncIterator, Optional
 
 from google import genai
 from google.genai import types
 
 from app.ai.llm.clients.base import LLMClient
+from app.ai.utils.token_counter import estimate_tokens_fast
+from app.settings.logging_config import get_logger
 from app.ai.llm.types import (
     ImageInput,
     LLMResponse,
@@ -23,6 +29,130 @@ from app.ai.llm.types import (
     ToolUseStartEvent,
     UsageEvent,
 )
+
+logger = get_logger(__name__)
+
+
+def _explicit_cache_enabled() -> bool:
+    return os.environ.get("BOW_GEMINI_EXPLICIT_CACHE", "1").lower() in ("1", "true", "yes")
+
+
+def _cache_ttl_seconds() -> int:
+    try:
+        return max(60, int(os.environ.get("BOW_GEMINI_CACHE_TTL_SECONDS", "1800")))
+    except (TypeError, ValueError):
+        return 1800
+
+
+# Gemini rejects explicit caches whose payload is below a model-specific token
+# floor (1k–4k depending on the model). Guard with a conservative estimate so we
+# don't pay a round-trip to create a cache the API will refuse; small prefixes
+# fall through to the inline (uncached) path. Override via env for tuning.
+def _cache_min_tokens() -> int:
+    try:
+        return max(0, int(os.environ.get("BOW_GEMINI_CACHE_MIN_TOKENS", "2048")))
+    except (TypeError, ValueError):
+        return 2048
+
+
+class _GeminiCacheManager:
+    """Process-local registry of Gemini explicit caches (``CachedContent``).
+
+    The static prefix of an agent request — the system instruction plus the
+    tool declarations — is byte-identical across every iteration of a planner
+    run and, because it derives from org-level config, across users and turns
+    hitting the same model. Caching it explicitly lets Gemini bill those tokens
+    at the cache-hit rate instead of full price on every call.
+
+    Keyed by a hash of ``(model_id, system, tools)``. Entries carry a local
+    expiry slightly inside the server-side TTL so we recreate before the cache
+    is evicted server-side. All failures degrade to ``None`` → the caller uses
+    the inline path, so caching never breaks a request.
+    """
+
+    def __init__(self) -> None:
+        # key -> (cache_name, local_expiry_monotonic)
+        self._entries: dict[str, tuple[str, float]] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _signature(model_id: str, system: Optional[str], tools_payload: str) -> str:
+        h = hashlib.sha256()
+        h.update((model_id or "").encode("utf-8"))
+        h.update(b"\x00")
+        h.update((system or "").encode("utf-8"))
+        h.update(b"\x00")
+        h.update(tools_payload.encode("utf-8"))
+        return h.hexdigest()
+
+    async def get_or_create(
+        self,
+        *,
+        client: "genai.Client",
+        model_id: str,
+        system: Optional[str],
+        tools: Optional[list["types.Tool"]],
+        tools_payload: str,
+        estimated_tokens: int,
+    ) -> Optional[str]:
+        if not _explicit_cache_enabled():
+            return None
+        if estimated_tokens < _cache_min_tokens():
+            # Below the model's cache floor — not worth a create round-trip.
+            return None
+
+        key = self._signature(model_id, system, tools_payload)
+        now = time.monotonic()
+
+        async with self._lock:
+            entry = self._entries.get(key)
+            if entry and entry[1] > now:
+                return entry[0]
+
+            ttl = _cache_ttl_seconds()
+            cfg_kwargs: dict = {"ttl": f"{ttl}s", "display_name": f"bow-prefix-{key[:16]}"}
+            if system:
+                cfg_kwargs["system_instruction"] = system
+            if tools:
+                cfg_kwargs["tools"] = tools
+
+            try:
+                loop = asyncio.get_running_loop()
+                cached = await loop.run_in_executor(
+                    None,
+                    lambda: client.caches.create(
+                        model=model_id,
+                        config=types.CreateCachedContentConfig(**cfg_kwargs),
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — caching must never break a call
+                logger.warning(
+                    "Gemini explicit cache create failed (model=%s); using inline path: %s",
+                    model_id,
+                    exc,
+                )
+                return None
+
+            name = getattr(cached, "name", None)
+            if not name:
+                return None
+            # Expire locally 60s before the server TTL to avoid a race where we
+            # reference a cache the server has just evicted.
+            self._entries[key] = (name, now + max(30, ttl - 60))
+            logger.debug(
+                "Gemini explicit cache created (model=%s, name=%s, ttl=%ss, ~%s tokens)",
+                model_id, name, ttl, estimated_tokens,
+            )
+            return name
+
+    async def evict(self, name: str) -> None:
+        async with self._lock:
+            for key, (cname, _) in list(self._entries.items()):
+                if cname == name:
+                    self._entries.pop(key, None)
+
+
+_CACHE_MANAGER = _GeminiCacheManager()
 
 
 class Google(LLMClient):
@@ -222,39 +352,85 @@ class Google(LLMClient):
             "thinking_config": thinking_config,
             "temperature": self.temperature,
         }
-        if system:
-            config_kwargs["system_instruction"] = system
-        if tools:
-            config_kwargs["tools"] = self._translate_tools(tools)
+
+        translated_tools = self._translate_tools(tools) if tools else None
+
+        # Explicit caching: hoist the static (system + tools) prefix into a
+        # server-side CachedContent and reference it by name. When a cache is in
+        # play we MUST NOT also pass system_instruction/tools inline — they live
+        # in the cache, and the API rejects supplying both. Falls back to the
+        # inline path whenever caching is disabled, the prefix is too small, or
+        # cache creation fails (get_or_create returns None).
+        tools_payload = json.dumps(
+            [{"name": t.name, "description": t.description, "input_schema": t.input_schema}
+             for t in (tools or [])],
+            sort_keys=True, default=str,
+        )
+        estimated_prefix_tokens = estimate_tokens_fast((system or "") + tools_payload)
+        cache_name = await _CACHE_MANAGER.get_or_create(
+            client=self.client,
+            model_id=model_id,
+            system=system,
+            tools=translated_tools,
+            tools_payload=tools_payload,
+            estimated_tokens=estimated_prefix_tokens,
+        )
+        if cache_name:
+            config_kwargs["cached_content"] = cache_name
+        else:
+            if system:
+                config_kwargs["system_instruction"] = system
+            if translated_tools:
+                config_kwargs["tools"] = translated_tools
 
         contents = self._translate_messages(messages)
         prompt_tokens = 0
         completion_tokens = 0
         stop_reason = "end_turn"
 
-        # google-genai sync generator — run in executor to avoid blocking
-        import asyncio
         loop = asyncio.get_running_loop()
 
-        def _collect():
+        def _collect(cfg_kwargs: dict):
             chunks = []
             for chunk in self.client.models.generate_content_stream(
                 model=model_id,
                 contents=contents,
-                config=types.GenerateContentConfig(**config_kwargs),
+                config=types.GenerateContentConfig(**cfg_kwargs),
             ):
                 chunks.append(chunk)
             return chunks
 
-        chunks = await loop.run_in_executor(None, _collect)
+        try:
+            chunks = await loop.run_in_executor(None, lambda: _collect(config_kwargs))
+        except Exception as exc:  # noqa: BLE001
+            # A stale/evicted cache reference fails the request. Evict our record
+            # and retry once on the inline path so a bad cache never breaks a call.
+            if cache_name:
+                logger.warning(
+                    "Gemini generate failed with cached_content=%s; retrying inline: %s",
+                    cache_name, exc,
+                )
+                await _CACHE_MANAGER.evict(cache_name)
+                config_kwargs.pop("cached_content", None)
+                if system:
+                    config_kwargs["system_instruction"] = system
+                if translated_tools:
+                    config_kwargs["tools"] = translated_tools
+                chunks = await loop.run_in_executor(None, lambda: _collect(config_kwargs))
+            else:
+                raise
 
         tool_call_counter = 0
         reasoning_started = False
+        cache_read_tokens = 0
         for chunk in chunks:
             usage_meta = getattr(chunk, "usage_metadata", None)
             if usage_meta:
                 prompt_tokens = getattr(usage_meta, "prompt_token_count", prompt_tokens) or prompt_tokens
                 completion_tokens = getattr(usage_meta, "candidates_token_count", completion_tokens) or completion_tokens
+                # Tokens served from the explicit cache (billed at the cache-hit
+                # rate). Gemini reports them separately from prompt_token_count.
+                cache_read_tokens = getattr(usage_meta, "cached_content_token_count", cache_read_tokens) or cache_read_tokens
 
             candidate = chunk.candidates[0] if chunk.candidates else None
             if not candidate:
@@ -294,6 +470,14 @@ class Google(LLMClient):
             yield ReasoningCompleteEvent(text="")
 
         yield MessageStopEvent(stop_reason=stop_reason)
-        yield UsageEvent(input_tokens=prompt_tokens, output_tokens=completion_tokens)
-        self._set_last_usage(LLMUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens))
+        yield UsageEvent(
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
+            cache_read_tokens=cache_read_tokens,
+        )
+        self._set_last_usage(LLMUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cache_read_tokens=cache_read_tokens,
+        ))
 

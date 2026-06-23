@@ -1,12 +1,14 @@
 import asyncio
 import base64
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncGenerator, AsyncIterator, Optional
 
 import boto3
 
 from app.ai.llm.clients.base import LLMClient
+from app.settings.logging_config import get_logger
 from app.ai.llm.types import (
     ImageInput,
     LLMResponse,
@@ -26,6 +28,22 @@ from app.ai.llm.types import (
 )
 
 _STREAM_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+
+logger = get_logger(__name__)
+
+
+def _prompt_cache_enabled() -> bool:
+    return os.environ.get("BOW_BEDROCK_PROMPT_CACHE", "1").lower() in ("1", "true", "yes")
+
+
+# Bedrock Converse marks cacheable prefixes with explicit `cachePoint` blocks:
+# everything up to and including the marker is cached, billed at the cache-read
+# rate on subsequent identical-prefix requests. We mark the system block and the
+# end of the tool list — both static across a planner run — mirroring the
+# Anthropic client. Only a subset of Bedrock models support caching (Claude 3.5+,
+# Nova); unsupported models raise a ValidationException, which we recover from by
+# retrying once without cache points (see `_converse_stream_with_fallback`).
+_CACHE_POINT = {"cachePoint": {"type": "default"}}
 
 
 # Map MIME types to Bedrock image format strings
@@ -241,6 +259,45 @@ class BedrockClient(LLMClient):
             ]
         }
 
+    @staticmethod
+    def _with_cache_points(request_kwargs: dict) -> dict:
+        """Return a copy of the request with cachePoint markers on the static
+        (system + tools) prefix. Everything up to and including each marker is
+        cached by Bedrock.
+
+        Only ``system`` and ``toolConfig`` are rebuilt; ``messages`` (which may
+        carry large image bytes) is shared by reference since it isn't mutated.
+        """
+        cached = dict(request_kwargs)
+        if cached.get("system"):
+            cached["system"] = list(cached["system"]) + [_CACHE_POINT]
+        tool_cfg = cached.get("toolConfig")
+        if tool_cfg and tool_cfg.get("tools"):
+            cached["toolConfig"] = {**tool_cfg, "tools": list(tool_cfg["tools"]) + [_CACHE_POINT]}
+        return cached
+
+    def _converse_stream_with_fallback(self, cached_kwargs: Optional[dict], plain_kwargs: dict):
+        """Start a converse_stream, preferring the cache-marked request.
+
+        Request validation (including unsupported cachePoint blocks) happens when
+        converse_stream() is called, before any event is iterated — so on a
+        cache-related ValidationException we can transparently retry the plain
+        request. Non-cache errors propagate unchanged.
+        """
+        if cached_kwargs is None:
+            return self.client.converse_stream(**plain_kwargs)
+        try:
+            return self.client.converse_stream(**cached_kwargs)
+        except Exception as exc:  # noqa: BLE001 — caching must never break a call
+            msg = str(exc).lower()
+            if "cachepoint" in msg or "cache" in msg or "validationexception" in msg:
+                logger.warning(
+                    "Bedrock prompt caching rejected (model=%s); retrying without cache points: %s",
+                    plain_kwargs.get("modelId"), exc,
+                )
+                return self.client.converse_stream(**plain_kwargs)
+            raise
+
     async def inference_stream_v2(
         self,
         model_id: str,
@@ -269,9 +326,15 @@ class BedrockClient(LLMClient):
             # skip it to keep compatibility with older botocore versions.
             request_kwargs["toolConfig"] = tc
 
+        # Prompt caching: mark the static (system + tools) prefix with cachePoint
+        # blocks. Disabled when thinking is on — interleaved reasoning changes the
+        # cacheable prefix and several models reject cache points alongside it.
+        cache_enabled = _prompt_cache_enabled() and not thinking
+        cached_kwargs = self._with_cache_points(request_kwargs) if cache_enabled else None
+
         def _sync_stream():
             try:
-                response = self.client.converse_stream(**request_kwargs)
+                response = self._converse_stream_with_fallback(cached_kwargs, request_kwargs)
                 for event in response["stream"]:
                     loop.call_soon_threadsafe(event_queue.put_nowait, event)
             finally:
@@ -285,6 +348,8 @@ class BedrockClient(LLMClient):
         current_block_index: int = -1
         prompt_tokens = 0
         completion_tokens = 0
+        cache_read_tokens = 0
+        cache_creation_tokens = 0
         stop_reason = "end_turn"
 
         while True:
@@ -369,9 +434,22 @@ class BedrockClient(LLMClient):
                 usage = event["metadata"].get("usage", {})
                 prompt_tokens = usage.get("inputTokens", prompt_tokens)
                 completion_tokens = usage.get("outputTokens", completion_tokens)
+                # Cache hit/write counts (present only on cache-capable models).
+                cache_read_tokens = usage.get("cacheReadInputTokens", cache_read_tokens) or cache_read_tokens
+                cache_creation_tokens = usage.get("cacheWriteInputTokens", cache_creation_tokens) or cache_creation_tokens
 
         await future
 
         yield MessageStopEvent(stop_reason=stop_reason)
-        yield UsageEvent(input_tokens=prompt_tokens, output_tokens=completion_tokens)
-        self._set_last_usage(LLMUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens))
+        yield UsageEvent(
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
+        self._set_last_usage(LLMUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        ))
