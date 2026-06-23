@@ -14,6 +14,7 @@ from app.models.data_source import DataSource
 from app.models.table_usage_event import TableUsageEvent
 from app.models.table_feedback_event import TableFeedbackEvent
 from app.ai.context.sections.code_section import CodeSection
+from app.ai.context.semantic_search import SemanticSearch
 
 # Cap the candidate set pulled for code-reuse ranking. Without it, the query
 # pulled EVERY step that ever used the current query's tables (O(usage history))
@@ -21,6 +22,11 @@ from app.ai.context.sections.code_section import CodeSection
 # this many recent candidates (id + data_model + stats, no code) and load code
 # only for the final picks.
 _CODE_CANDIDATE_CAP = 50
+
+# Weight given to embedding similarity when blending it into the success-snippet
+# composite. When semantic search is unavailable (no embeddings / engine down)
+# this weight is redistributed back onto column-Jaccard so behavior is unchanged.
+_SEMANTIC_SUCCESS_WEIGHT = 0.35
 
 
 class CodeContextBuilder:
@@ -120,6 +126,9 @@ class CodeContextBuilder:
             return []
 
         fb_map = await self._load_feedback_map(allowed_ds_ids, since_ts)
+        sem_scores = await self._semantic_step_scores(
+            data_model, [str(r[0]) for r in step_rows]
+        )
         ranked: List[Tuple[float, Dict]] = []
         for step_id, step_dm, last_used_at, succ, fail, attempts in step_rows:
             sid = str(step_id)
@@ -131,7 +140,15 @@ class CodeContextBuilder:
             success_rate = float(succ or 0) / attempts_n if attempts_n > 0 else 0.0
             recency, last_used_str = self._recency(now_utc, last_used_at)
 
-            score = 0.55 * col_sim + 0.20 * success_rate + 0.20 * feedback_score + 0.05 * recency
+            # Blend embedding similarity with column-Jaccard. When semantic
+            # search is unavailable, the semantic weight collapses back onto
+            # col_sim so the composite is identical to the pre-semantic ranking.
+            if sem_scores is not None:
+                sem = float(sem_scores.get(sid, 0.0))
+                similarity = _SEMANTIC_SUCCESS_WEIGHT * sem + (0.55 - _SEMANTIC_SUCCESS_WEIGHT) * col_sim
+            else:
+                similarity = 0.55 * col_sim
+            score = similarity + 0.20 * success_rate + 0.20 * feedback_score + 0.05 * recency
 
             ranked.append((
                 score,
@@ -239,12 +256,22 @@ class CodeContextBuilder:
                 )
             )
 
+        sem_scores = await self._semantic_step_scores(
+            data_model, [sid for sid, _ in tmp_holder]
+        )
         ranked: List[Tuple[float, Dict]] = []
         for sid, data in tmp_holder:
-            # Failed ranking: prioritize similarity, failure rate proxy (via neg feedback and usage), and recency
+            # Failed ranking: prioritize similarity, failure rate proxy (via neg feedback and usage), and recency.
+            # Blend embedding similarity into the similarity term when available;
+            # otherwise the full weight stays on column-Jaccard (unchanged).
+            if sem_scores is not None:
+                sem = float(sem_scores.get(sid, 0.0))
+                similarity = _SEMANTIC_SUCCESS_WEIGHT * sem + (0.60 - _SEMANTIC_SUCCESS_WEIGHT) * data["col_sim"]
+            else:
+                similarity = 0.60 * data["col_sim"]
             failure_component = 0.5 * data["neg_feedback"] + 0.5 * data["usage"]["failure_rate"]
             feedback_balance_penalty = max(0.0, data.get("pos_feedback", 0.0) - data.get("neg_feedback", 0.0))
-            score = 0.60 * data["col_sim"] + 0.20 * data["recency"] + 0.20 * failure_component - 0.05 * feedback_balance_penalty
+            score = similarity + 0.20 * data["recency"] + 0.20 * failure_component - 0.05 * feedback_balance_penalty
             ranked.append(
                 (
                     score,
@@ -384,6 +411,39 @@ class CodeContextBuilder:
         await self._attach_code(top, max_len=3000)
         return top
 
+
+    def _data_model_text(self, data_model: Dict) -> str:
+        """Build a natural-language-ish description of a data model for embedding."""
+        parts: List[str] = []
+        if isinstance(data_model, dict):
+            for key in ("title", "name", "description"):
+                val = data_model.get(key)
+                if isinstance(val, str) and val.strip():
+                    parts.append(val.strip())
+            for c in data_model.get("columns", []) or []:
+                if isinstance(c, dict):
+                    name = c.get("generated_column_name") or c.get("name")
+                    if name:
+                        parts.append(str(name))
+                    desc = c.get("description")
+                    if isinstance(desc, str) and desc.strip():
+                        parts.append(desc.strip())
+        return " ".join(parts)
+
+    async def _semantic_step_scores(
+        self, data_model: Dict, step_ids: List[str]
+    ) -> Optional[Dict[str, float]]:
+        """Embedding similarity for candidate steps, or None to skip blending."""
+        query = self._data_model_text(data_model)
+        if not query or not step_ids:
+            return None
+        try:
+            ss = SemanticSearch(self.db, self.organization)
+            return await ss.rank(
+                query, owner_type="step", top_k=len(step_ids), candidate_ids=step_ids
+            )
+        except Exception:
+            return None
 
     def _extract_generated_columns(self, data_model: Dict) -> Set[str]:
         try:

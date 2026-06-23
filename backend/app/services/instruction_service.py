@@ -268,8 +268,17 @@ class InstructionService:
         except Exception:
             pass
 
+        # Keep-fresh: refresh this instruction's embedding off the request path.
+        try:
+            from app.ai.context.semantic_search import schedule_index
+            schedule_index(
+                str(organization.id), "instruction", [(str(instruction.id), instruction.text or "")]
+            )
+        except Exception:
+            pass
+
         return await self._instruction_to_schema_with_references(db, instruction)
-    
+
     async def analyze_instruction(
         self,
         db: AsyncSession,
@@ -333,7 +342,18 @@ class InstructionService:
             # Do NOT fallback to the full list when no matches; return empty when nothing is relevant
             base_candidates = filtered
             candidates = [it for it in base_candidates if not exclude_id or str(it.id) != exclude_id]
-            ranked = self._rank_related_instructions(tokens, candidates)
+            sem_scores = None
+            try:
+                from app.ai.context.semantic_search import SemanticSearch
+                sem_scores = await SemanticSearch(db, organization).rank(
+                    request.text,
+                    owner_type="instruction",
+                    top_k=len(candidates),
+                    candidate_ids=[str(it.id) for it in candidates],
+                )
+            except Exception:
+                sem_scores = None
+            ranked = self._rank_related_instructions(tokens, candidates, sem_scores)
             top_k = ranked[: max(0, request.limits.instructions)]
             items = [
                 RelatedInstructionItem(
@@ -468,15 +488,31 @@ class InstructionService:
         tokens = {t for t in raw if t and len(t) >= 3 and t not in stop}
         return tokens
 
-    def _rank_related_instructions(self, tokens: set[str], items: List[InstructionListSchema]) -> List[InstructionListSchema]:
-        """Rank by naive Jaccard similarity on tokens within text."""
+    def _rank_related_instructions(
+        self,
+        tokens: set[str],
+        items: List[InstructionListSchema],
+        sem_scores: Optional[dict] = None,
+    ) -> List[InstructionListSchema]:
+        """Rank by token Jaccard, blended with semantic similarity when available.
+
+        ``sem_scores`` maps instruction id → similarity in [0,1]. When None
+        (semantic search unavailable), this is identical to the prior Jaccard
+        ranking.
+        """
         def jaccard(a: set[str], b: set[str]) -> float:
             u = len(a | b)
             return 0.0 if u == 0 else len(a & b) / u
         scored: list[tuple[float, InstructionListSchema]] = []
         for it in items:
             t = self._tokenize_text(it.text or "")
-            scored.append((jaccard(tokens, t), it))
+            jac = jaccard(tokens, t)
+            if sem_scores is not None:
+                sem = float(sem_scores.get(str(it.id), 0.0))
+                score = 0.5 * jac + 0.5 * sem
+            else:
+                score = jac
+            scored.append((score, it))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [it for _, it in scored]
 
@@ -884,6 +920,16 @@ class InstructionService:
                 resource_type="instruction",
                 resource_id=str(instruction.id),
                 details={"title": instruction.title, "category": instruction.category},
+            )
+        except Exception:
+            pass
+
+        # Keep-fresh: re-embed on text change (content_hash makes this a no-op
+        # when the text is unchanged).
+        try:
+            from app.ai.context.semantic_search import schedule_index
+            schedule_index(
+                str(organization.id), "instruction", [(str(instruction.id), instruction.text or "")]
             )
         except Exception:
             pass

@@ -468,6 +468,52 @@ class LLM:
                 should_record=should_record,
             )
 
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        usage_scope: Optional[str] = "embedding",
+        usage_scope_ref_id: Optional[str] = None,
+        should_record: bool = True,
+    ) -> list[list[float]]:
+        """Embed a batch of texts via the active provider client.
+
+        Records prompt-token usage (embeddings are prompt-only) the same way the
+        inference paths do, when the client reports it.
+        """
+        if not texts:
+            return []
+        with tracer.start_as_current_span("llm.embed") as span:
+            span.set_attribute("llm.model_id", self.model_id)
+            span.set_attribute("llm.provider", self.provider)
+            span.set_attribute("llm.embed_batch", len(texts))
+            try:
+                vectors = await self.client.embed(model_id=self.model_id, texts=texts)
+            except NotImplementedError:
+                raise
+            except Exception as e:
+                span.set_status(StatusCode.ERROR, str(e))
+                span.record_exception(e)
+                raise RuntimeError(
+                    f"LLM embed failed (provider={self.provider}, model={self.model_id}): {e}"
+                ) from e
+
+            prompt_tokens = 0
+            if hasattr(self.client, "pop_last_usage"):
+                prompt_tokens = self.client.pop_last_usage().prompt_tokens or 0
+            if not prompt_tokens:
+                prompt_tokens = sum(self._estimate_tokens_fast(t) for t in texts)
+            span.set_attribute("llm.prompt_tokens", prompt_tokens)
+
+            self._schedule_usage_record(
+                scope=usage_scope,
+                scope_ref_id=usage_scope_ref_id,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
+                should_record=should_record,
+            )
+            return vectors
+
     async def test_connection(self, prompt: str = "Hello, how are you?"):
         logger.info("Testing LLM connection: provider=%s, model=%s", self.provider, self.model_id)
         try:
