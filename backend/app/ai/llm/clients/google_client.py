@@ -7,6 +7,7 @@ import time
 from typing import AsyncGenerator, AsyncIterator, Optional
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 from app.ai.llm.clients.base import LLMClient
@@ -45,14 +46,21 @@ def _cache_ttl_seconds() -> int:
 
 
 # Gemini rejects explicit caches whose payload is below a model-specific token
-# floor (1k–4k depending on the model). Guard with a conservative estimate so we
-# don't pay a round-trip to create a cache the API will refuse; small prefixes
-# fall through to the inline (uncached) path. Override via env for tuning.
-def _cache_min_tokens() -> int:
-    try:
-        return max(0, int(os.environ.get("BOW_GEMINI_CACHE_MIN_TOKENS", "2048")))
-    except (TypeError, ValueError):
-        return 2048
+# floor: the Gemini 3.x family requires 4096 tokens, Gemini 2.5 (and older)
+# require 2048. Guard with a conservative estimate so we don't pay a round-trip
+# to create a cache the API will refuse; small prefixes fall through to the
+# inline (uncached) path. The BOW_GEMINI_CACHE_MIN_TOKENS env override, when set,
+# takes precedence over the model-specific floors.
+def _cache_min_tokens(model_id: str) -> int:
+    override = os.environ.get("BOW_GEMINI_CACHE_MIN_TOKENS")
+    if override is not None:
+        try:
+            return max(0, int(override))
+        except (TypeError, ValueError):
+            pass
+    if "gemini-3" in (model_id or "").lower():
+        return 4096
+    return 2048
 
 
 class _GeminiCacheManager:
@@ -76,8 +84,14 @@ class _GeminiCacheManager:
         self._lock = asyncio.Lock()
 
     @staticmethod
-    def _signature(model_id: str, system: Optional[str], tools_payload: str) -> str:
+    def _signature(
+        cred_id: str, model_id: str, system: Optional[str], tools_payload: str
+    ) -> str:
         h = hashlib.sha256()
+        # Namespace by credential/project so caches created under one Gemini
+        # credential are never reused (or evicted) by another in the same process.
+        h.update((cred_id or "").encode("utf-8"))
+        h.update(b"\x00")
         h.update((model_id or "").encode("utf-8"))
         h.update(b"\x00")
         h.update((system or "").encode("utf-8"))
@@ -89,25 +103,31 @@ class _GeminiCacheManager:
         self,
         *,
         client: "genai.Client",
+        cred_id: str,
         model_id: str,
         system: Optional[str],
         tools: Optional[list["types.Tool"]],
         tools_payload: str,
         estimated_tokens: int,
-    ) -> Optional[str]:
-        if not _explicit_cache_enabled():
-            return None
-        if estimated_tokens < _cache_min_tokens():
-            # Below the model's cache floor — not worth a create round-trip.
-            return None
+    ) -> tuple[Optional[str], int]:
+        """Return ``(cache_name, cache_creation_tokens)``.
 
-        key = self._signature(model_id, system, tools_payload)
+        ``cache_creation_tokens`` is non-zero only on the call that actually
+        created the cache server-side; cache hits (reused entries) report 0.
+        """
+        if not _explicit_cache_enabled():
+            return None, 0
+        if estimated_tokens < _cache_min_tokens(model_id):
+            # Below the model's cache floor — not worth a create round-trip.
+            return None, 0
+
+        key = self._signature(cred_id, model_id, system, tools_payload)
         now = time.monotonic()
 
         async with self._lock:
             entry = self._entries.get(key)
             if entry and entry[1] > now:
-                return entry[0]
+                return entry[0], 0
 
             ttl = _cache_ttl_seconds()
             cfg_kwargs: dict = {"ttl": f"{ttl}s", "display_name": f"bow-prefix-{key[:16]}"}
@@ -131,19 +151,24 @@ class _GeminiCacheManager:
                     model_id,
                     exc,
                 )
-                return None
+                return None, 0
 
             name = getattr(cached, "name", None)
             if not name:
-                return None
+                return None, 0
+            # Tokens billed (at standard input rate) to populate the cache. Surfaced
+            # on the created CachedContent's usage metadata.
+            cache_meta = getattr(cached, "usage_metadata", None)
+            creation_tokens = getattr(cache_meta, "total_token_count", 0) or 0
             # Expire locally 60s before the server TTL to avoid a race where we
             # reference a cache the server has just evicted.
             self._entries[key] = (name, now + max(30, ttl - 60))
             logger.debug(
-                "Gemini explicit cache created (model=%s, name=%s, ttl=%ss, ~%s tokens)",
-                model_id, name, ttl, estimated_tokens,
+                "Gemini explicit cache created (model=%s, name=%s, ttl=%ss, ~%s tokens, "
+                "creation_tokens=%s)",
+                model_id, name, ttl, estimated_tokens, creation_tokens,
             )
-            return name
+            return name, creation_tokens
 
     async def evict(self, name: str) -> None:
         async with self._lock:
@@ -160,6 +185,9 @@ class Google(LLMClient):
         super().__init__()
         self.client = genai.Client(api_key=api_key)
         self.temperature = 0.3
+        # Stable, non-secret namespace for the shared cache registry so caches
+        # are never shared across distinct Gemini credentials/projects.
+        self._cred_id = hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:16]
 
     @staticmethod
     def _build_contents(prompt: str, images: Optional[list[ImageInput]] = None) -> str | list:
@@ -367,8 +395,9 @@ class Google(LLMClient):
             sort_keys=True, default=str,
         )
         estimated_prefix_tokens = estimate_tokens_fast((system or "") + tools_payload)
-        cache_name = await _CACHE_MANAGER.get_or_create(
+        cache_name, cache_creation_tokens = await _CACHE_MANAGER.get_or_create(
             client=self.client,
+            cred_id=self._cred_id,
             model_id=model_id,
             system=system,
             tools=translated_tools,
@@ -400,12 +429,21 @@ class Google(LLMClient):
                 chunks.append(chunk)
             return chunks
 
+        def _is_cached_content_reference_error(exc: Exception) -> bool:
+            # A stale/evicted/inaccessible cached_content reference surfaces as a
+            # ClientError with a 404 (NOT_FOUND). Anything else (rate limits, auth,
+            # safety/provider errors) must NOT trigger a second billable generation.
+            return (
+                isinstance(exc, genai_errors.ClientError)
+                and getattr(exc, "code", None) == 404
+            )
+
         try:
             chunks = await loop.run_in_executor(None, lambda: _collect(config_kwargs))
         except Exception as exc:  # noqa: BLE001
-            # A stale/evicted cache reference fails the request. Evict our record
-            # and retry once on the inline path so a bad cache never breaks a call.
-            if cache_name:
+            # Only a stale/evicted cache reference is recoverable here. Evict our
+            # record and retry once on the inline path; all other errors propagate.
+            if cache_name and _is_cached_content_reference_error(exc):
                 logger.warning(
                     "Gemini generate failed with cached_content=%s; retrying inline: %s",
                     cache_name, exc,
@@ -470,14 +508,21 @@ class Google(LLMClient):
             yield ReasoningCompleteEvent(text="")
 
         yield MessageStopEvent(stop_reason=stop_reason)
+        # cache_creation_tokens: tokens billed to populate the explicit cache on
+        # this call (0 on cache hits). TODO: add a Google/Gemini branch in
+        # LLMUsageRecorder._calc_input_cost() to bill cache reads at the reduced
+        # rate and account for creation/storage costs; today Gemini cache tokens
+        # fall through to standard full-rate input billing.
         yield UsageEvent(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
             cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
         )
         self._set_last_usage(LLMUsage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
         ))
 

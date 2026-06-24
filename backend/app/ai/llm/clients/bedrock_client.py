@@ -2,8 +2,9 @@ import asyncio
 import base64
 import json
 import os
+from collections.abc import AsyncGenerator, AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from typing import AsyncGenerator, AsyncIterator, Optional
+from typing import Optional
 
 import boto3
 
@@ -44,6 +45,11 @@ def _prompt_cache_enabled() -> bool:
 # Nova); unsupported models raise a ValidationException, which we recover from by
 # retrying once without cache points (see `_converse_stream_with_fallback`).
 _CACHE_POINT = {"cachePoint": {"type": "default"}}
+
+# Models that have rejected a cache-point request at least once this process.
+# Once a modelId lands here we skip the cached attempt entirely and go straight
+# to the plain request, avoiding a redundant ValidationException on every call.
+_CACHE_POINT_UNSUPPORTED_MODELS: set[str] = set()
 
 
 # Map MIME types to Bedrock image format strings
@@ -284,13 +290,16 @@ class BedrockClient(LLMClient):
         cache-related ValidationException we can transparently retry the plain
         request. Non-cache errors propagate unchanged.
         """
-        if cached_kwargs is None:
+        model_id = str(plain_kwargs.get("modelId") or "")
+        if cached_kwargs is None or model_id in _CACHE_POINT_UNSUPPORTED_MODELS:
             return self.client.converse_stream(**plain_kwargs)
         try:
             return self.client.converse_stream(**cached_kwargs)
         except Exception as exc:  # noqa: BLE001 — caching must never break a call
             msg = str(exc).lower()
             if "cachepoint" in msg or "cache" in msg or "validationexception" in msg:
+                if model_id:
+                    _CACHE_POINT_UNSUPPORTED_MODELS.add(model_id)
                 logger.warning(
                     "Bedrock prompt caching rejected (model=%s); retrying without cache points: %s",
                     plain_kwargs.get("modelId"), exc,
