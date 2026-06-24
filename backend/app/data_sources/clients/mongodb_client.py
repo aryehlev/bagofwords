@@ -163,7 +163,10 @@ class MongodbClient(DataSourceClient):
         from app.data_sources.clients.lazy_frame import consume_row_dicts_to_lazyframe, StreamConfig
 
         cfg = StreamConfig()
-        query_dict = json.loads(query)
+        try:
+            query_dict = json.loads(query)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON query: {e}")
         collection_name = query_dict.get("collection")
         if not collection_name:
             raise ValueError("Query must specify 'collection'")

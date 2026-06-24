@@ -943,14 +943,13 @@ async def current_user(
     import os
     if os.environ.get("BOW_DEV_AUTOLOGIN") == "1":
         dev_email = os.environ.get("BOW_DEV_USER_EMAIL")
+        # Fail closed: only auto-login when an explicit dev email is provided.
+        # Never auto-select an arbitrary (possibly privileged) first user.
         if dev_email:
             result = await db.execute(select(User).where(User.email == dev_email))
             dev_user = result.scalars().first()
-        else:
-            result = await db.execute(select(User).order_by(User.email.asc()))
-            dev_user = result.scalars().first()
-        if dev_user is not None:
-            return dev_user
+            if dev_user is not None:
+                return dev_user
 
     # No valid authentication
     raise HTTPException(

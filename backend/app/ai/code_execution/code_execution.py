@@ -18,16 +18,6 @@ from contextlib import redirect_stdout
 from typing import Dict, Any, Tuple, List, Optional, Callable, Coroutine
 
 from app.ai.http.safe_client import SafeHttpClient
-
-# `redirect_stdout` mutates the *global* sys.stdout. When the code-exec
-# thread pool runs N executions concurrently, the enter/exit ordering
-# can leave sys.stdout pointing at a sibling thread's already-closed
-# StringIO buffer. The next print/df.info()/etc. inside ANY thread then
-# raises ValueError("I/O operation on closed file"). Serializing the
-# redirect_stdout window with a lock keeps the (very brief) duration of
-# the redirect race-free; user code executes inside the lock but it's
-# already CPU-bound by the GIL, so wall-clock impact is negligible.
-_STDOUT_REDIRECT_LOCK = threading.Lock()
 from app.schemas.organization_settings_schema import OrganizationSettingsConfig, FeatureState
 from app.services.usage_policy_service import UsageLimitContext, usage_policy_service
 from typing import TYPE_CHECKING
@@ -40,6 +30,16 @@ from app.core.otel import get_tracer
 from opentelemetry.trace import StatusCode
 from app.errors.app_error import AppError
 from app.errors.codes import ErrorCode
+
+# `redirect_stdout` mutates the *global* sys.stdout. When the code-exec
+# thread pool runs N executions concurrently, the enter/exit ordering
+# can leave sys.stdout pointing at a sibling thread's already-closed
+# StringIO buffer. The next print/df.info()/etc. inside ANY thread then
+# raises ValueError("I/O operation on closed file"). Serializing the
+# redirect_stdout window with a lock keeps the (very brief) duration of
+# the redirect race-free; user code executes inside the lock but it's
+# already CPU-bound by the GIL, so wall-clock impact is negligible.
+_STDOUT_REDIRECT_LOCK = threading.Lock()
 
 # Hard fallback when neither connection nor org settings define a value.
 DEFAULT_QUERY_TIMEOUT_SECONDS = 60
@@ -397,6 +397,10 @@ class QueryCapturingClientWrapper:
                     _q_ms = (_time.monotonic() - _q_start) * 1000.0
                     rows = len(cached) if hasattr(cached, '__len__') else None
                     result_bytes = estimate_result_size_bytes(cached)
+                    # Cache hits are still metered: a cached read consumes the
+                    # same query/data-bytes quota as a cache miss would.
+                    self._consume_query_quota(query)
+                    self._consume_data_bytes_quota(query, result_bytes, rows)
                     span.set_attribute("datasource.cache", "hit")
                     if rows is not None:
                         span.set_attribute("datasource.result_rows", rows)
@@ -478,6 +482,10 @@ class QueryCapturingClientWrapper:
                 if cached is not None:
                     _q_ms = (_time.monotonic() - _q_start) * 1000.0
                     result_bytes = cached.byte_size() if hasattr(cached, "byte_size") else 0
+                    # Cache hits are still metered: a cached lazy read consumes
+                    # the same query/data-bytes quota as a cache miss would.
+                    self._consume_query_quota(query)
+                    self._consume_data_bytes_quota(query, result_bytes, None)
                     span.set_attribute("datasource.cache", "hit")
                     span.set_attribute("datasource.result_bytes", result_bytes)
                     self._captured_timings.append({

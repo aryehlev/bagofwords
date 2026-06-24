@@ -159,9 +159,16 @@ class NetsuiteClient(DataSourceClient):
         import json
         from app.data_sources.clients.lazy_frame import consume_row_dicts_to_lazyframe
 
+        # Hard caps so pagination can never loop unbounded on large datasets
+        # (mirrors the eager _execute_suiteql max_rows guard).
+        max_rows = 100_000
+        max_pages = 10_000
+
         def rows():
             with self.connect() as session:
                 offset, limit = 0, 1000
+                emitted = 0
+                pages = 0
                 while True:
                     resp = session.post(
                         self._base_url,
@@ -173,11 +180,19 @@ class NetsuiteClient(DataSourceClient):
                         raise RuntimeError(f"SuiteQL error ({resp.status_code}): {resp.text}")
                     data = resp.json()
                     for item in data.get("items", []):
+                        if emitted >= max_rows:
+                            break
                         yield {
                             k: (json.dumps(v) if isinstance(v, (dict, list)) else v)
                             for k, v in item.items()
                         }
-                    if not data.get("hasMore", False):
+                        emitted += 1
+                    pages += 1
+                    if (
+                        not data.get("hasMore", False)
+                        or emitted >= max_rows
+                        or pages >= max_pages
+                    ):
                         break
                     offset += limit
 

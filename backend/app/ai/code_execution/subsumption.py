@@ -42,6 +42,7 @@ class QueryShape:
     is_full_scan: bool = False                # safe to subsume FROM
     columns: Optional[Union[str, FrozenSet[str]]] = None  # STAR or explicit set (full-scan only)
     referenced_columns: FrozenSet[str] = frozenset()
+    select_star: bool = False                 # new query projects a top-level `*` / `t.*`
 
 
 def _normalized_table(table) -> str:
@@ -76,9 +77,15 @@ def analyze(sql: str) -> QueryShape:
 
     referenced_columns = frozenset(c.name.lower() for c in tree.find_all(exp.Column) if c.name)
 
+    # Track top-level `*` / `t.*` projections; these need every source column.
+    select_star = any(
+        isinstance(e, exp.Star) or e.find(exp.Star) is not None
+        for e in tree.expressions
+    )
+
     # Full-scan determination (matters when THIS query is a cache entry).
     is_full_scan = False
-    columns: Optional[Union[str, FrozenSet[str]]] = None
+    columns: str | FrozenSet[str] | None = None
     if single_table:
         no_row_changing_clause = all(
             tree.find(node) is None
@@ -115,6 +122,7 @@ def analyze(sql: str) -> QueryShape:
         is_full_scan=is_full_scan,
         columns=columns,
         referenced_columns=referenced_columns,
+        select_star=select_star,
     )
 
 
@@ -125,6 +133,11 @@ def can_subsume(cached: QueryShape, new: QueryShape) -> bool:
     if not (new.analyzable and new.single_table and new.base_table):
         return False
     if cached.base_table != new.base_table:
+        return False
+    # A `SELECT *` new query needs every source column; only a `SELECT *`
+    # cached scan is guaranteed to contain them. An explicit-column cached
+    # scan would silently drop the columns it never captured.
+    if new.select_star and cached.columns != STAR:
         return False
     if cached.columns == STAR:
         return True

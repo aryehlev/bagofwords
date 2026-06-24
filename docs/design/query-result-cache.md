@@ -1,8 +1,9 @@
 # Query Result Cache + Out-of-Core Results
 
 Two independent, additive features that reduce how often we re-query data sources
-and how much result data we hold in memory. Both default to the existing behavior;
-neither changes `execute_query`.
+and how much result data we hold in memory. Both default to the existing behavior:
+the `execute_query` API is unchanged, and its runtime behavior changes only when
+the cache is explicitly enabled (see below).
 
 - **Result Lake** (`app/ai/code_execution/result_lake.py`) — a process-local TTL
   cache of query results on disk (Parquet), so identical generated queries aren't
@@ -28,6 +29,7 @@ the result spilled to Parquet, and the entry indexed. Eviction is **cost-aware**
 cheap ones dropped first.
 
 ### Configuration (env)
+
 | Var | Default | Meaning |
 |---|---|---|
 | `BOW_RESULT_CACHE_ENABLED` | `0` (off) | Master switch |
@@ -94,6 +96,7 @@ All enforce a row/byte cap (`BOW_LAZY_MAX_ROWS`, `BOW_LAZY_MAX_BYTES`,
 (`query.result_too_large`, HTTP 413) on oversized scans, deleting the partial file.
 
 ### Configuration (env)
+
 | Var | Default | Meaning |
 |---|---|---|
 | `BOW_LAZY_CHUNKSIZE` | 50_000 | Rows/records per streamed chunk |

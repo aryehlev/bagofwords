@@ -64,15 +64,31 @@ def test_ttl_expiry(tmp_path, df):
     assert lake.get("scope", "SELECT * FROM t") is None
 
 
+def _parquet_size(tmp_path, df: pd.DataFrame) -> int:
+    """Actual on-disk Parquet byte size of `df` (what the lake's budget meters
+    against). Derive caps from this rather than hard-coding magic byte counts,
+    which are sensitive to pyarrow encoding/version changes."""
+    p = tmp_path / "_probe.parquet"
+    df.to_parquet(p, index=False)
+    size = p.stat().st_size
+    p.unlink()
+    return size
+
+
 def test_cost_aware_eviction_keeps_expensive(tmp_path):
     big = pd.DataFrame({"x": range(2000)})
-    lake = ResultLake(_cfg(tmp_path, max_bytes=20_000))
+    # Budget for ~2 entries so the third put provably forces an eviction,
+    # regardless of the exact Parquet size on this pyarrow version.
+    entry_size = _parquet_size(tmp_path, big)
+    lake = ResultLake(_cfg(tmp_path, max_bytes=int(entry_size * 2.5)))
     lake.put("s", "q_cheap", big, cost_ms=300)
     lake.get("s", "q_cheap")  # 1 hit
     lake.put("s", "q_expensive", big, cost_ms=60_000)
     lake.put("s", "q_filler", big, cost_ms=300)  # push over budget
     stats = lake.stats()
     assert stats["total_bytes"] <= stats["max_bytes"]
+    # The expensive (high value/byte) entry must survive eviction; a cheaper
+    # one is dropped instead.
     assert lake.get("s", "q_expensive") is not None
 
 
@@ -112,7 +128,10 @@ def test_put_df_readable_via_owned_copy_interop(tmp_path, df):
 
 def test_owned_copy_survives_eviction(tmp_path):
     big = pd.DataFrame({"x": range(2000)})
-    lake = ResultLake(_cfg(tmp_path / "cache", max_bytes=20_000))
+    # Budget for ~2 entries so registering several more high-value entries
+    # provably evicts q1 (independent of exact Parquet encoding size).
+    entry_size = _parquet_size(tmp_path, big)
+    lake = ResultLake(_cfg(tmp_path / "cache", max_bytes=int(entry_size * 2.5)))
     src = tmp_path / "s.parquet"
     big.to_parquet(src, index=False)
     lake.register_path("s", "q1", str(src), cost_ms=500, source_class="X")

@@ -332,12 +332,42 @@ def stream_dbapi_cursor_to_parquet(connect_cm, sql, path, config):
 def stream_duckdb_to_parquet(connect_cm, sql, path, config):
     """Native DuckDB path: COPY the query result straight to Parquet. DuckDB
     streams to disk and never materializes the result in Python — zero ingest
-    memory. Used by DuckDB-backed clients (duckdb, qvd)."""
+    memory. Used by DuckDB-backed clients (duckdb, qvd).
+
+    Enforces the same StreamConfig caps as the chunked streamers: the COPY is
+    bounded by `LIMIT max_rows + 1` so it can never write an unbounded file,
+    then the actual row count and on-disk byte size are checked. If either cap
+    is exceeded the partial file is deleted and ResultTooLargeError is raised.
+
+    Note: the SQL below interpolates `inner` (the client-built query, same string
+    that all other streamers run) and the single-quote-escaped output path. No
+    end-user-supplied value is interpolated unescaped, so this is not an
+    injection surface beyond what the eager query path already trusts.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     inner = sql.strip().rstrip(";")
     target = str(path).replace("'", "''")
-    with connect_cm() as con:
-        con.execute(f"COPY ({inner}) TO '{target}' (FORMAT PARQUET)")
+    # Cap the result at max_rows + 1 so we can detect (and reject) overflow
+    # without ever writing an unbounded file to disk.
+    bounded = f"SELECT * FROM ({inner}) AS _bow_src LIMIT {int(config.max_rows) + 1}"
+    try:
+        with connect_cm() as con:
+            con.execute(f"COPY ({bounded}) TO '{target}' (FORMAT PARQUET)")
+            rows = con.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{target}')"
+            ).fetchone()[0]
+        byte_estimate = path.stat().st_size if path.exists() else 0
+        if rows > config.max_rows or byte_estimate > config.max_bytes:
+            raise ResultTooLargeError(
+                rows=int(rows), byte_estimate=int(byte_estimate),
+                limit_desc=config.limit_desc(),
+            )
+    except BaseException:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
     return path
 
 

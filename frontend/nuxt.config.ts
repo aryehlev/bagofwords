@@ -191,7 +191,10 @@ export default defineNuxtConfig({
       enableRefreshPeriodically: false
     },
     globalAppMiddleware: {
-      isEnabled: false
+      // Keep the global auth guard enabled in production; only disable it in
+      // development (the custom *.global.ts middleware handle post-auth checks
+      // but do not enforce authentication themselves).
+      isEnabled: process.env.NODE_ENV === 'production'
     },
     rewriteRedirects: true,
     fullPathRedirect: true
