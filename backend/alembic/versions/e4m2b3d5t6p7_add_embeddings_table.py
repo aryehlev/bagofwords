@@ -14,12 +14,11 @@ dialect-specific, so this migration branches on the bind dialect:
   ``vector_distance_cos`` is fine at this scale and avoids needing libSQL at
   migration time.
 
-DIM defaults to 384 (local fastembed bge-small) and is overridable at migration
-time via ``BOW_EMBEDDING_DIM`` for deployments standardizing on a larger model
-(e.g. 1536 for OpenAI text-embedding-3-small). Switching the active model later
-requires a re-embed/backfill.
+DIM is fixed at 384 (local fastembed bge-small) so this revision is
+deterministic and reproducible across environments. Standardizing on a larger
+model (e.g. 1536 for OpenAI text-embedding-3-small) requires a dedicated
+follow-up migration plus a re-embed/backfill.
 """
-import os
 from typing import Sequence, Union
 
 from alembic import op
@@ -30,7 +29,7 @@ down_revision: Union[str, None] = 'e3m1b2d4t5p6'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-DIM = int(os.getenv("BOW_EMBEDDING_DIM", "384"))
+DIM = 384
 
 
 def upgrade() -> None:

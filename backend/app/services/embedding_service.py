@@ -91,6 +91,7 @@ async def _resolve_embedding_model(
             select(LLMModel).where(
                 LLMModel.id == configured_id,
                 LLMModel.organization_id == organization.id,
+                LLMModel.model_type == "embedding",
                 LLMModel.is_enabled == True,  # noqa: E712
             )
         )
@@ -106,6 +107,7 @@ async def _resolve_embedding_model(
             LLMModel.model_type == "embedding",
             LLMModel.is_enabled == True,  # noqa: E712
         )
+        .order_by(LLMModel.id.asc())
         .limit(1)
     )
     return row.scalar_one_or_none()

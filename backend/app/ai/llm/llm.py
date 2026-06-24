@@ -483,10 +483,18 @@ class LLM:
         """
         if not texts:
             return []
+        # Enforce quota guardrails up front, like the inference paths do, so
+        # embedding-heavy jobs can't bypass in-memory quota enforcement.
+        prompt_tokens_estimate = sum(self._estimate_tokens_fast(t) for t in texts)
+        await self._check_usage_limit_async(prompt_tokens_estimate, should_record=should_record)
         with tracer.start_as_current_span("llm.embed") as span:
             span.set_attribute("llm.model_id", self.model_id)
             span.set_attribute("llm.provider", self.provider)
             span.set_attribute("llm.embed_batch", len(texts))
+            # Drain any stale usage from a prior request so pop_last_usage()
+            # below can't misattribute it to this embed batch.
+            if hasattr(self.client, "pop_last_usage"):
+                self.client.pop_last_usage()
             try:
                 vectors = await self.client.embed(model_id=self.model_id, texts=texts)
             except NotImplementedError:
@@ -497,12 +505,17 @@ class LLM:
                 raise RuntimeError(
                     f"LLM embed failed (provider={self.provider}, model={self.model_id}): {e}"
                 ) from e
+            if len(vectors) != len(texts):
+                raise RuntimeError(
+                    f"LLM embed cardinality mismatch (provider={self.provider}, model={self.model_id}, "
+                    f"expected={len(texts)}, got={len(vectors)})"
+                )
 
             prompt_tokens = 0
             if hasattr(self.client, "pop_last_usage"):
                 prompt_tokens = self.client.pop_last_usage().prompt_tokens or 0
             if not prompt_tokens:
-                prompt_tokens = sum(self._estimate_tokens_fast(t) for t in texts)
+                prompt_tokens = prompt_tokens_estimate
             span.set_attribute("llm.prompt_tokens", prompt_tokens)
 
             self._schedule_usage_record(
@@ -510,6 +523,13 @@ class LLM:
                 scope_ref_id=usage_scope_ref_id,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=0,
+                should_record=should_record,
+            )
+            await self._record_usage_limit_async(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
+                scope=usage_scope,
+                scope_ref_id=usage_scope_ref_id,
                 should_record=should_record,
             )
             return vectors

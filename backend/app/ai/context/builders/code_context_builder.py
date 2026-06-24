@@ -143,9 +143,9 @@ class CodeContextBuilder:
             # Blend embedding similarity with column-Jaccard. When semantic
             # search is unavailable, the semantic weight collapses back onto
             # col_sim so the composite is identical to the pre-semantic ranking.
-            if sem_scores is not None:
-                sem = float(sem_scores.get(sid, 0.0))
-                similarity = _SEMANTIC_SUCCESS_WEIGHT * sem + (0.55 - _SEMANTIC_SUCCESS_WEIGHT) * col_sim
+            sem = sem_scores.get(sid) if sem_scores is not None else None
+            if sem is not None:
+                similarity = _SEMANTIC_SUCCESS_WEIGHT * float(sem) + (0.55 - _SEMANTIC_SUCCESS_WEIGHT) * col_sim
             else:
                 similarity = 0.55 * col_sim
             score = similarity + 0.20 * success_rate + 0.20 * feedback_score + 0.05 * recency
@@ -264,9 +264,9 @@ class CodeContextBuilder:
             # Failed ranking: prioritize similarity, failure rate proxy (via neg feedback and usage), and recency.
             # Blend embedding similarity into the similarity term when available;
             # otherwise the full weight stays on column-Jaccard (unchanged).
-            if sem_scores is not None:
-                sem = float(sem_scores.get(sid, 0.0))
-                similarity = _SEMANTIC_SUCCESS_WEIGHT * sem + (0.60 - _SEMANTIC_SUCCESS_WEIGHT) * data["col_sim"]
+            sem = sem_scores.get(sid) if sem_scores is not None else None
+            if sem is not None:
+                similarity = _SEMANTIC_SUCCESS_WEIGHT * float(sem) + (0.60 - _SEMANTIC_SUCCESS_WEIGHT) * data["col_sim"]
             else:
                 similarity = 0.60 * data["col_sim"]
             failure_component = 0.5 * data["neg_feedback"] + 0.5 * data["usage"]["failure_rate"]

@@ -27,6 +27,8 @@ from app.settings.database import create_async_session_factory
 from app.models.organization import Organization
 from app.models.instruction import Instruction
 from app.models.step import Step
+from app.models.widget import Widget
+from app.models.report import Report
 from app.ai.context.semantic_search import SemanticSearch
 
 
@@ -78,13 +80,31 @@ async def backfill_org(session, org: Organization, days: int, batch_size: int) -
     n_inst = await _chunked_index(ss, "instruction", inst_items, batch_size)
 
     since = datetime.now(timezone.utc) - timedelta(days=days) if days > 0 else None
-    step_stmt = select(Step)
-    if since is not None:
-        step_stmt = step_stmt.where(Step.created_at >= since)
-    step_rows = (await session.execute(step_stmt.limit(5000))).scalars().all()
-    step_items = [(str(s.id), _step_text(s)) for s in step_rows]
-    step_items = [(sid, txt) for sid, txt in step_items if txt]
-    n_step = await _chunked_index(ss, "step", step_items, batch_size)
+    # Scope steps to this org via Step -> Widget -> Report.organization_id (Step
+    # has no organization_id), and page through them so tenants with more than
+    # one page of steps aren't silently truncated.
+    n_step = 0
+    page_size = 5000
+    offset = 0
+    while True:
+        step_stmt = (
+            select(Step)
+            .join(Widget, Step.widget_id == Widget.id)
+            .join(Report, Widget.report_id == Report.id)
+            .where(Report.organization_id == org.id)
+        )
+        if since is not None:
+            step_stmt = step_stmt.where(Step.created_at >= since)
+        step_stmt = step_stmt.order_by(Step.id.asc()).limit(page_size).offset(offset)
+        step_rows = (await session.execute(step_stmt)).scalars().all()
+        if not step_rows:
+            break
+        step_items = [(str(s.id), _step_text(s)) for s in step_rows]
+        step_items = [(sid, txt) for sid, txt in step_items if txt]
+        n_step += await _chunked_index(ss, "step", step_items, batch_size)
+        if len(step_rows) < page_size:
+            break
+        offset += page_size
 
     print(f"[org={org.id}] embedded {n_inst} instructions, {n_step} steps")
 

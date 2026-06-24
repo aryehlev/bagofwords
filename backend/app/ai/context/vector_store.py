@@ -180,7 +180,9 @@ class PgVectorStore(VectorStore):
         if bind_extra:
             stmt = stmt.bindparams(*bind_extra)
         rows = (await self.db.execute(stmt, params)).all()
-        return [(oid, float(score)) for oid, score in rows]
+        # cosine distance is in [0, 2], so 1 - distance is in [-1, 1]; clamp the
+        # tiny-negative / opposite-direction tail to keep scores in [0, 1].
+        return [(oid, max(0.0, float(score))) for oid, score in rows]
 
 
 class LibsqlVectorStore(VectorStore):
@@ -301,7 +303,8 @@ class LibsqlVectorStore(VectorStore):
                     ),
                     params,
                 ).all()
-            return [(oid, float(score)) for oid, score in rows]
+            # See PgVectorStore.query: clamp [-1, 1] cosine score into [0, 1].
+            return [(oid, max(0.0, float(score))) for oid, score in rows]
 
         try:
             return await self._run(_do)

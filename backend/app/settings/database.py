@@ -441,5 +441,7 @@ def create_libsql_vector_engine():
 def reset_libsql_vector_engine():
     """Drop the cached libSQL vector engine (used by tests)."""
     global _libsql_vector_engine_singleton, _LIBSQL_UNAVAILABLE
+    if _libsql_vector_engine_singleton is not None:
+        _libsql_vector_engine_singleton.dispose()
     _libsql_vector_engine_singleton = None
     _LIBSQL_UNAVAILABLE = False

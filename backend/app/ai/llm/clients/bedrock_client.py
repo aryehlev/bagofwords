@@ -108,10 +108,11 @@ class BedrockClient(LLMClient):
             return [float(x) for x in payload["embedding"]]
 
         loop = asyncio.get_running_loop()
-        return [
-            await loop.run_in_executor(_STREAM_EXECUTOR, _embed_one, t)
+        futures = [
+            loop.run_in_executor(_STREAM_EXECUTOR, _embed_one, t)
             for t in texts
         ]
+        return await asyncio.gather(*futures)
 
     @staticmethod
     def _build_content(prompt: str, images: Optional[list[ImageInput]] = None) -> list[dict]:

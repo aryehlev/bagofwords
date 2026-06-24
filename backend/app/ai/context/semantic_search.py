@@ -160,6 +160,11 @@ class SemanticSearch:
             if not changed:
                 return 0
             vectors = await svc.embed_texts([txt for _, txt in changed])
+            if len(vectors) != len(changed):
+                raise RuntimeError(
+                    f"Embedding count mismatch for owner_type={owner_type}: "
+                    f"expected {len(changed)}, got {len(vectors)}"
+                )
             rows = [
                 EmbeddingRow(
                     organization_id=str(self.organization.id),
@@ -170,7 +175,7 @@ class SemanticSearch:
                     dim=svc.dim,
                     vector=vec,
                 )
-                for (oid, _), vec in zip(changed, vectors)
+                for (oid, _), vec in zip(changed, vectors, strict=True)
             ]
             await store.upsert(rows)
             return len(rows)
