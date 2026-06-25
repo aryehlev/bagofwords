@@ -31,6 +31,15 @@ class Google(LLMClient):
         self.client = genai.Client(api_key=api_key)
         self.temperature = 0.3
 
+    async def embed(self, model_id: str, texts: list[str]) -> list[list[float]]:
+        """Embed via the Gemini embeddings endpoint, preserving input order."""
+        if not texts:
+            return []
+        resp = await self.client.aio.models.embed_content(
+            model=model_id, contents=texts
+        )
+        return [list(map(float, e.values)) for e in resp.embeddings]
+
     @staticmethod
     def _build_contents(prompt: str, images: Optional[list[ImageInput]] = None) -> str | list:
         """Build contents, either as string or list with Parts for multimodal."""

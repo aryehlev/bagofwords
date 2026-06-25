@@ -218,6 +218,14 @@ class Database(BaseModel):
         region=os.getenv("BOW_DATABASE_AUTH_REGION", ""),
         ssl_mode=os.getenv("BOW_DATABASE_SSL_MODE", ""),
     ))
+    # Optional libSQL/Turso settings for the dedicated vector engine used on
+    # SQLite deployments (semantic search). When `libsql_url` is set it points
+    # the vector engine at a remote Turso DB; otherwise the vector engine uses
+    # the same local SQLite file as the main (aiosqlite) engine.
+    libsql_url: str = Field(default_factory=lambda: os.getenv("BOW_LIBSQL_URL", ""))
+    libsql_auth_token: str = Field(
+        default_factory=lambda: os.getenv("BOW_LIBSQL_AUTH_TOKEN", "")
+    )
 
     def get_url(self) -> str:
         """Build the connection URL.

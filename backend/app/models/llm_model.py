@@ -153,11 +153,49 @@ LLM_MODEL_DETAILS = [
     }
 ]
 
+# Embedding-model catalog (model_type="embedding"). Kept *separate* from
+# LLM_MODEL_DETAILS so the chat-model seeder (which force-enables every entry and
+# may pick the first enabled one as the org default) never treats these as chat
+# models. The API embedding backend is opt-in: an admin creates/enables one of
+# these and points `organization_settings.default_embedding_model_id` at it. A
+# deployment standardizes on one active model/dimension at a time (switching
+# requires a re-embed); `embedding_dim` is the fixed vector width.
+EMBEDDING_MODEL_DETAILS = [
+    {
+        "name": "OpenAI text-embedding-3-small",
+        "model_id": "text-embedding-3-small",
+        "provider_type": "openai",
+        "embedding_dim": 1536,
+    },
+    {
+        "name": "OpenAI text-embedding-3-large",
+        "model_id": "text-embedding-3-large",
+        "provider_type": "openai",
+        "embedding_dim": 3072,
+    },
+    {
+        "name": "Gemini text-embedding-004",
+        "model_id": "text-embedding-004",
+        "provider_type": "google",
+        "embedding_dim": 768,
+    },
+]
+
+# Fallback dimensions for known embedding model ids, used when a model row has
+# no explicit `embedding_dim`.
+EMBEDDING_MODEL_DIMS = {
+    d["model_id"]: d["embedding_dim"] for d in EMBEDDING_MODEL_DETAILS
+}
+
 class LLMModel(BaseSchema):
     __tablename__ = "llm_models"
     
     name = Column(String, nullable=False)
     model_id = Column(String, nullable=False)  # The actual model ID used with the provider
+    # Role of the model: "chat" (default) drives inference; "embedding" powers
+    # semantic retrieval. A NULL value is treated as "chat" for back-compat.
+    model_type = Column(String, nullable=False, default="chat", server_default="chat")
+    embedding_dim = Column(Integer, nullable=True)  # Vector width for embedding models
     is_custom = Column(Boolean, default=False)  # Whether this is a custom model ID
     config = Column(JSON, nullable=True)  # Model-specific configurations
     is_preset = Column(Boolean, default=False, nullable=False)  # If True, cannot be deleted
@@ -199,3 +237,16 @@ class LLMModel(BaseSchema):
         if detail:
             return detail.get("output_cost_per_million_tokens_usd")
         return None
+
+    def get_embedding_dim(self) -> int | None:
+        """Resolve the vector width for an embedding model.
+
+        Prefers the explicit column, then the static preset detail, then the
+        known-id fallback map.
+        """
+        if self.embedding_dim is not None:
+            return int(self.embedding_dim)
+        detail = self._get_static_details()
+        if detail and detail.get("embedding_dim"):
+            return int(detail["embedding_dim"])
+        return EMBEDDING_MODEL_DIMS.get(self.model_id)

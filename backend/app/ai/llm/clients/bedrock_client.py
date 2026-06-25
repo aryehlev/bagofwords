@@ -89,6 +89,31 @@ class BedrockClient(LLMClient):
         self._region = region
         self._auth_mode = auth_mode
 
+    async def embed(self, model_id: str, texts: list[str]) -> list[list[float]]:
+        """Embed via Bedrock ``invoke_model`` (Titan-style, one input per call).
+
+        Titan Text Embeddings accept a single ``inputText`` per request, so we
+        issue one call per text. Runs the blocking boto3 calls on the shared
+        stream executor to avoid blocking the event loop.
+        """
+        if not texts:
+            return []
+
+        def _embed_one(text: str) -> list[float]:
+            response = self.client.invoke_model(
+                modelId=model_id,
+                body=json.dumps({"inputText": text}),
+            )
+            payload = json.loads(response["body"].read())
+            return [float(x) for x in payload["embedding"]]
+
+        loop = asyncio.get_running_loop()
+        futures = [
+            loop.run_in_executor(_STREAM_EXECUTOR, _embed_one, t)
+            for t in texts
+        ]
+        return await asyncio.gather(*futures)
+
     @staticmethod
     def _build_content(prompt: str, images: Optional[list[ImageInput]] = None) -> list[dict]:
         """Build Bedrock message content blocks."""

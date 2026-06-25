@@ -5,6 +5,7 @@ from sqlalchemy.pool import NullPool
 from app.settings.config import settings
 from app.settings.db_auth import get_auth_provider
 from app.core.otel import instrument_db
+from typing import Optional
 import logging
 import os
 
@@ -369,3 +370,78 @@ def create_async_session_factory():
     engine = create_async_database_engine()
     async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     return async_session
+
+
+# Dedicated *sync* libSQL engine for vector operations on SQLite deployments.
+# General app tables keep using aiosqlite (async); only the `embeddings` table's
+# vector reads/writes go through this engine, called from inside
+# `run_in_executor` in app/ai/context/vector_store.py. libSQL exposes the
+# native vector functions (vector32 / vector_distance_cos) that plain SQLite
+# lacks, and points at the *same* DB file (or a remote Turso DB) — coexistence
+# with the aiosqlite connections relies on WAL mode (set via the pragmas below).
+_libsql_vector_engine_singleton = None
+_LIBSQL_UNAVAILABLE = False
+
+
+def _resolve_libsql_url() -> Optional[str]:
+    """Build the libSQL URL for the vector engine, or None if not applicable.
+
+    Returns None on Postgres deployments (which use pgvector instead) or when
+    the libSQL dialect/driver isn't installed.
+    """
+    db_config = settings.bow_config.database
+    # Explicit remote Turso configuration wins.
+    remote = getattr(db_config, "libsql_url", "")
+    if remote:
+        token = getattr(db_config, "libsql_auth_token", "")
+        sep = "&" if "?" in remote else "?"
+        suffix = f"{sep}authToken={token}&secure=true" if token else ""
+        return f"sqlite+libsql://{remote.split('://')[-1]}{suffix}"
+
+    # Otherwise mirror the main sqlite file.
+    base_url = _get_test_database_url() if settings.TESTING else _get_database_url()
+    if "sqlite" not in base_url:
+        return None  # Postgres deployment — no libSQL vector engine.
+    # sqlite:///path  ->  sqlite+libsql:///path
+    return base_url.replace("sqlite+aiosqlite:", "sqlite:").replace(
+        "sqlite:", "sqlite+libsql:"
+    )
+
+
+def create_libsql_vector_engine():
+    """Return the process-wide sync libSQL vector engine, or None if unavailable.
+
+    Caches the engine (and a negative result) so a missing driver doesn't retry
+    the import on every query. Callers must treat None as "vector engine
+    unavailable" and fall back to literal ranking.
+    """
+    global _libsql_vector_engine_singleton, _LIBSQL_UNAVAILABLE
+    if _libsql_vector_engine_singleton is not None:
+        return _libsql_vector_engine_singleton
+    if _LIBSQL_UNAVAILABLE:
+        return None
+
+    url = _resolve_libsql_url()
+    if url is None:
+        _LIBSQL_UNAVAILABLE = True
+        return None
+    try:
+        engine = create_engine(url, poolclass=NullPool, future=True)
+        # WAL + busy_timeout so the libSQL connections coexist with aiosqlite's.
+        event.listen(engine, "connect", _set_sqlite_pragmas)
+        _libsql_vector_engine_singleton = engine
+        return engine
+    except Exception as exc:  # driver missing / dialect not registered
+        logger.warning("libSQL vector engine unavailable (%s); semantic search on "
+                       "SQLite will fall back to literal ranking.", exc)
+        _LIBSQL_UNAVAILABLE = True
+        return None
+
+
+def reset_libsql_vector_engine():
+    """Drop the cached libSQL vector engine (used by tests)."""
+    global _libsql_vector_engine_singleton, _LIBSQL_UNAVAILABLE
+    if _libsql_vector_engine_singleton is not None:
+        _libsql_vector_engine_singleton.dispose()
+    _libsql_vector_engine_singleton = None
+    _LIBSQL_UNAVAILABLE = False
