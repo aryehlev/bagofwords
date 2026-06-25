@@ -74,6 +74,15 @@ class LLMUsageRecorderService:
             # but actually charge 0.5× for those tokens. Apply the 50% discount.
             if cache_read_tokens:
                 cost -= (cache_read_tokens / 1_000_000) * rate_f * 0.5
+        elif provider_type == "google":
+            # Gemini reports cached tokens inside prompt_token_count at full rate,
+            # but explicit-cache reads are billed at 0.25× the input rate — apply the
+            # 75% discount on the cached portion. Cache-creation tokens are a separate
+            # one-time charge at the full input rate.
+            if cache_read_tokens:
+                cost -= (cache_read_tokens / 1_000_000) * rate_f * 0.75
+            if cache_creation_tokens:
+                cost += (cache_creation_tokens / 1_000_000) * rate_f
         return max(cost, 0.0)
 
     @staticmethod

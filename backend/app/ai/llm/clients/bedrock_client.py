@@ -322,7 +322,12 @@ class BedrockClient(LLMClient):
             return self.client.converse_stream(**cached_kwargs)
         except Exception as exc:  # noqa: BLE001 — caching must never break a call
             msg = str(exc).lower()
-            if "cachepoint" in msg or "cache" in msg or "validationexception" in msg:
+            # Only treat this as a cache-point rejection when the error explicitly
+            # blames the injected cachePoint blocks. A generic ValidationException
+            # (malformed request, bad message, etc.) must NOT permanently blacklist
+            # the model and silently disable prompt caching for the whole process —
+            # it would also fail the plain retry, so let it propagate instead.
+            if "cachepoint" in msg or "cache point" in msg:
                 if model_id:
                     _CACHE_POINT_UNSUPPORTED_MODELS.add(model_id)
                 logger.warning(

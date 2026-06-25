@@ -921,6 +921,11 @@ class BuildService:
             )
             .where(BuildContent.build_id == build_id)
         )
+        # Re-embed instructions on promotion-to-main using the now-live version
+        # text. Embeddings are keyed by the shared instruction id, so refreshing
+        # here (rather than on every draft edit) keeps semantic ranking aligned
+        # with what is actually live in main instead of drifting to pending edits.
+        reindex_items: list[tuple[str, str]] = []
         for instruction_id, version_id, v_text, v_title, v_description, v_load_mode, v_applicable_modes, v_applicable_channels, v_category_ids, v_status in rows.all():
             category = None
             if v_category_ids:
@@ -928,6 +933,7 @@ class BuildService:
             values = {"current_version_id": version_id}
             if v_text is not None:
                 values["text"] = v_text
+                reindex_items.append((str(instruction_id), v_text))
             if v_title is not None:
                 values["title"] = v_title
             # description is nullable and clearable — always sync it to the version's value
@@ -954,6 +960,15 @@ class BuildService:
             )
 
         await db.commit()
+
+        # Refresh embeddings for the instructions whose live text changed on this
+        # promotion (content_hash makes unchanged text a no-op). Best-effort.
+        if reindex_items:
+            try:
+                from app.ai.context.semantic_search import schedule_index
+                schedule_index(str(build.organization_id), "instruction", reindex_items)
+            except Exception:
+                pass
 
         # Audit log
         try:

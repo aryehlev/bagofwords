@@ -29,6 +29,18 @@ def test_analyze_where_is_not_full_scan():
     assert s.analyzable and s.single_table and not s.is_full_scan
 
 
+def test_analyze_offset_is_not_full_scan():
+    # OFFSET drops leading rows, so the result is not a complete table scan and
+    # must not subsume queries like SELECT COUNT(*) FROM orders.
+    s = analyze("SELECT * FROM orders OFFSET 10")
+    assert s.analyzable and s.single_table and not s.is_full_scan
+
+
+def test_analyze_limit_offset_is_not_full_scan():
+    s = analyze("SELECT * FROM orders LIMIT 5 OFFSET 10")
+    assert not s.is_full_scan
+
+
 def test_analyze_groupby_is_not_full_scan():
     s = analyze("SELECT a, SUM(b) FROM orders GROUP BY a")
     assert not s.is_full_scan

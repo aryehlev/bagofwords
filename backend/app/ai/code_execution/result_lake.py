@@ -260,8 +260,14 @@ class ResultLake:
         try:
             key = self._key(scope, sql)
             with self._lock:
-                if key in self._index:
-                    return  # already cached & fresh; don't duplicate work
+                entry = self._index.get(key)
+                if entry is not None:
+                    if time.monotonic() - entry.created_at > self.config.ttl_for(entry.source_class):
+                        # Stale entry: purge now so the freshly streamed Parquet replaces it
+                        # instead of being dropped (a later read would otherwise miss).
+                        self._remove_locked(key)
+                    else:
+                        return  # already cached & fresh; don't duplicate work
             dest = self.config.root / f"{key}.parquet"
             tmp = self.config.root / f".{key}.{uuid.uuid4().hex}.tmp"
             _link_or_copy(Path(src_path), tmp)

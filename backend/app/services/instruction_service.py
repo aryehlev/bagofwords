@@ -924,15 +924,11 @@ class InstructionService:
         except Exception:
             pass
 
-        # Keep-fresh: re-embed on text change (content_hash makes this a no-op
-        # when the text is unchanged).
-        try:
-            from app.ai.context.semantic_search import schedule_index
-            schedule_index(
-                str(organization.id), "instruction", [(str(instruction.id), instruction.text or "")]
-            )
-        except Exception:
-            pass
+        # Note: embeddings are refreshed on promotion-to-main (see
+        # BuildService.promote_build), NOT here. An edit may sit in a draft/pending
+        # build whose text is not yet live; re-embedding the mutable row text here
+        # would make semantic ranking use a vector that does not match the live
+        # main-build version for this instruction id.
 
         return await self._instruction_to_schema_with_references(db, instruction)
 

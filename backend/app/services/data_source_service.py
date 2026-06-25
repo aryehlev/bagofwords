@@ -1874,7 +1874,7 @@ class DataSourceService:
                 allowed = params
 
             client = ClientClass(**allowed)
-            self._attach_client_quota_metadata(client, data_source, conn, key)
+            self._attach_client_quota_metadata(client, data_source, conn, key, current_user)
             clients[key] = client
 
         # Backward compatibility: add legacy key aliases for single-connection domains
@@ -1885,13 +1885,22 @@ class DataSourceService:
 
         return clients
 
-    def _attach_client_quota_metadata(self, client, data_source: DataSource, connection, client_key: str) -> None:
+    def _attach_client_quota_metadata(self, client, data_source: DataSource, connection, client_key: str, current_user: User | None = None) -> None:
         try:
             setattr(client, "_bow_connection_id", str(connection.id))
             setattr(client, "_bow_connection_name", connection.name)
             setattr(client, "_bow_data_source_id", str(data_source.id))
             setattr(client, "_bow_data_source_name", data_source.name)
             setattr(client, "_bow_client_key", client_key)
+            # Per-user result-cache identity. For `user_required` connections each
+            # user resolves their own (delegated) credentials, so query results can
+            # differ per user — the result cache MUST be scoped per user to avoid
+            # leaking one user's rows to another via a shared cache entry. System-
+            # credential connections share one identity, so their cache is shared.
+            cache_identity = ""
+            if (getattr(connection, "auth_policy", None) or "system_only") == "user_required" and current_user is not None:
+                cache_identity = f"user:{current_user.id}"
+            setattr(client, "_bow_cache_identity", cache_identity)
             # Per-connection query timeout override (read by the code-execution
             # wrapper). Stored on the client so the wrapper does not need DB
             # access to resolve it.

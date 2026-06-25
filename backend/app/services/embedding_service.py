@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.embeddings import local_embedder
 from app.ai.llm.llm import LLM
+from app.models.embedding import DEFAULT_EMBEDDING_DIM
 from app.models.llm_model import LLMModel
 from app.models.organization import Organization
 from app.settings.logging_config import get_logger
@@ -140,6 +141,18 @@ async def build_embedding_service(
             logger.warning(
                 "Embedding model %s has no known dimension; using local instead",
                 model.model_id,
+            )
+            return EmbeddingService()
+        if dim != DEFAULT_EMBEDDING_DIM:
+            # The embeddings store is a fixed-width vector(384)/F32_BLOB(384) column.
+            # An API model with a different dimension (e.g. 768/1536/3072) would
+            # produce vectors the schema cannot accept, so semantic indexing would
+            # fail on upsert. Fall back to local until the storage layer supports
+            # multiple dimensions.
+            logger.warning(
+                "Embedding model %s has dim=%s but the embeddings store is fixed at "
+                "%s; using local instead to avoid incompatible writes.",
+                model.model_id, dim, DEFAULT_EMBEDDING_DIM,
             )
             return EmbeddingService()
         return EmbeddingService(llm=llm, dim=dim)

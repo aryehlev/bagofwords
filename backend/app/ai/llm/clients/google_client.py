@@ -422,21 +422,30 @@ class Google(LLMClient):
                 config_kwargs["tools"] = translated_tools
 
         contents = self._translate_messages(messages)
+        # Propagate any screenshots / user-uploaded images. PromptBuilderV3 carries
+        # them separately from the text messages, so attach them to the latest user
+        # turn here — otherwise they are silently dropped on Gemini planner turns.
+        if images:
+            image_parts = []
+            for img in images:
+                if img.source_type == "url":
+                    image_parts.append(types.Part.from_uri(file_uri=img.data, mime_type=img.media_type))
+                else:
+                    image_bytes = base64.b64decode(img.data)
+                    image_parts.append(types.Part.from_bytes(data=image_bytes, mime_type=img.media_type))
+            if image_parts:
+                last_user = next((c for c in reversed(contents) if c.role == "user"), None)
+                if last_user is not None:
+                    last_user.parts = list(last_user.parts or []) + image_parts
+                else:
+                    contents.append(types.Content(role="user", parts=image_parts))
         prompt_tokens = 0
         completion_tokens = 0
         stop_reason = "end_turn"
 
         loop = asyncio.get_running_loop()
-
-        def _collect(cfg_kwargs: dict):
-            chunks = []
-            for chunk in self.client.models.generate_content_stream(
-                model=model_id,
-                contents=contents,
-                config=types.GenerateContentConfig(**cfg_kwargs),
-            ):
-                chunks.append(chunk)
-            return chunks
+        event_queue: asyncio.Queue = asyncio.Queue()
+        _STREAM_END = object()
 
         def _is_cached_content_reference_error(exc: Exception) -> bool:
             # A stale/evicted/inaccessible cached_content reference surfaces as a
@@ -447,30 +456,63 @@ class Google(LLMClient):
                 and getattr(exc, "code", None) == 404
             )
 
-        try:
-            chunks = await loop.run_in_executor(None, lambda: _collect(config_kwargs))
-        except Exception as exc:  # noqa: BLE001
-            # Only a stale/evicted cache reference is recoverable here. Evict our
-            # record and retry once on the inline path; all other errors propagate.
-            if cache_name and _is_cached_content_reference_error(exc):
-                logger.warning(
-                    "Gemini generate failed with cached_content=%s; retrying inline: %s",
-                    cache_name, exc,
-                )
-                await _CACHE_MANAGER.evict(cache_name)
-                config_kwargs.pop("cached_content", None)
-                if system:
-                    config_kwargs["system_instruction"] = system
-                if translated_tools:
-                    config_kwargs["tools"] = translated_tools
-                chunks = await loop.run_in_executor(None, lambda: _collect(config_kwargs))
-            else:
-                raise
+        def _open_stream(cfg_kwargs: dict):
+            return self.client.models.generate_content_stream(
+                model=model_id,
+                contents=contents,
+                config=types.GenerateContentConfig(**cfg_kwargs),
+            )
+
+        def _sync_stream():
+            # Stream chunks to the async consumer as they arrive — do NOT buffer the
+            # whole generator first, or text/reasoning/tool-use deltas would only be
+            # emitted after the model finishes, defeating live SSE streaming.
+            try:
+                _sentinel = object()
+                try:
+                    it = iter(_open_stream(config_kwargs))
+                    first = next(it, _sentinel)
+                except Exception as exc:  # noqa: BLE001
+                    # Only a stale/evicted cache reference is recoverable here, and
+                    # only before any chunk has been emitted. Evict and retry once on
+                    # the inline path; all other errors propagate.
+                    if cache_name and _is_cached_content_reference_error(exc):
+                        logger.warning(
+                            "Gemini generate failed with cached_content=%s; retrying inline: %s",
+                            cache_name, exc,
+                        )
+                        asyncio.run_coroutine_threadsafe(
+                            _CACHE_MANAGER.evict(cache_name), loop
+                        ).result()
+                        config_kwargs.pop("cached_content", None)
+                        if system:
+                            config_kwargs["system_instruction"] = system
+                        if translated_tools:
+                            config_kwargs["tools"] = translated_tools
+                        it = iter(_open_stream(config_kwargs))
+                        first = next(it, _sentinel)
+                    else:
+                        raise
+                if first is not _sentinel:
+                    loop.call_soon_threadsafe(event_queue.put_nowait, first)
+                    for chunk in it:
+                        loop.call_soon_threadsafe(event_queue.put_nowait, chunk)
+            except Exception as exc:  # noqa: BLE001 — surface to the async consumer
+                loop.call_soon_threadsafe(event_queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(event_queue.put_nowait, _STREAM_END)
+
+        loop.run_in_executor(None, _sync_stream)
 
         tool_call_counter = 0
         reasoning_started = False
         cache_read_tokens = 0
-        for chunk in chunks:
+        while True:
+            chunk = await event_queue.get()
+            if chunk is _STREAM_END:
+                break
+            if isinstance(chunk, BaseException):
+                raise chunk
             usage_meta = getattr(chunk, "usage_metadata", None)
             if usage_meta:
                 prompt_tokens = getattr(usage_meta, "prompt_token_count", prompt_tokens) or prompt_tokens
@@ -518,10 +560,9 @@ class Google(LLMClient):
 
         yield MessageStopEvent(stop_reason=stop_reason)
         # cache_creation_tokens: tokens billed to populate the explicit cache on
-        # this call (0 on cache hits). TODO: add a Google/Gemini branch in
-        # LLMUsageRecorder._calc_input_cost() to bill cache reads at the reduced
-        # rate and account for creation/storage costs; today Gemini cache tokens
-        # fall through to standard full-rate input billing.
+        # this call (0 on cache hits). LLMUsageRecorder._calc_input_cost() has a
+        # Google branch that bills cache reads at 0.25× and creation at full input
+        # rate (storage cost is not modelled).
         yield UsageEvent(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,

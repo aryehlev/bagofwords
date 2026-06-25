@@ -142,15 +142,20 @@ class LazyFrame:
     # -- lifecycle ----------------------------------------------------------
 
     def close(self) -> None:
+        # Derived frames from .sql()/.limit() share the parent's DuckDB connection
+        # and backing file (owns_source=False). They must tear down neither, or a
+        # `with lf.sql(...) as d:` block would close the connection the parent still
+        # needs and any later parent.to_df() would fail on a closed connection.
+        if not self._owns_source:
+            return
         try:
             self._con.close()
         except Exception:
             logger.debug("LazyFrame: failed to close duckdb connection", exc_info=True)
-        if self._owns_source:
-            try:
-                Path(self._source_path).unlink(missing_ok=True)
-            except Exception:
-                logger.debug("LazyFrame: failed to unlink %s", self._source_path, exc_info=True)
+        try:
+            Path(self._source_path).unlink(missing_ok=True)
+        except Exception:
+            logger.debug("LazyFrame: failed to unlink %s", self._source_path, exc_info=True)
 
     def __enter__(self) -> "LazyFrame":
         return self

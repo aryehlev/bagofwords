@@ -37,7 +37,7 @@ class VerticaClient(DataSourceClient):
         }
 
     def connect(self):
-        """Establish connection to Vertica using verticapy."""
+        """Establish (and re-activate) this client's Vertica connection."""
         try:
             if not self._connected:
                 # Create new connection in verticapy
@@ -45,9 +45,13 @@ class VerticaClient(DataSourceClient):
                     self.connection_params,
                     name=self._connection_name
                 )
-                # Set this connection as active
-                vp.connect(self._connection_name)
                 self._connected = True
+            # Always re-activate THIS client's named connection as verticapy's
+            # global active connection. verticapy keeps a single active connection
+            # process-wide, so another VerticaClient may have stolen it since our
+            # last call — both the eager (vDataFrame) and lazy (current_cursor)
+            # paths must run against our session, not whichever was last activated.
+            vp.connect(self._connection_name)
             return self._connection_name
         except Exception as e:
             raise RuntimeError(f"Failed to connect to Vertica: {e}")

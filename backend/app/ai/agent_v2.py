@@ -2791,7 +2791,8 @@ class AgentV2:
                                     schemas_ctx = await self.context_hub.schema_builder.build(
                                         with_stats=True,
                                     )
-                                schemas_excerpt = schemas_ctx.render_combined(top_k_per_ds=10, index_limit=200)
+                                # Keep the stable schema payload so turn 2+ still hits the provider-side prompt cache.
+                                schemas_excerpt = schemas_ctx.render_combined(top_k_per_ds=self.top_k_schema, index_limit=INDEX_LIMIT, stable=True)
                             except Exception:
                                 schemas_excerpt = view.static.schemas.render() if getattr(view.static, "schemas", None) else ""
                             # Refresh history summary with updated context
@@ -3297,7 +3298,12 @@ class AgentV2:
 
                             # Refresh for next iteration
                             view = await self._refresh_warm_traced("post_tool_next_iteration", loop_index=loop_index)
-                            schemas_excerpt = view.static.schemas.render() if getattr(view.static, "schemas", None) else ""
+                            # Keep the stable schema payload so later turns stay on the cached prompt path.
+                            _schemas_ctx_next = view.static.schemas
+                            try:
+                                schemas_excerpt = _schemas_ctx_next.render_combined(top_k_per_ds=self.top_k_schema, index_limit=INDEX_LIMIT, stable=True) if _schemas_ctx_next else ""
+                            except Exception:
+                                schemas_excerpt = _schemas_ctx_next.render() if _schemas_ctx_next else ""
                             history_summary = self.context_hub.get_history_summary(self.context_hub.observation_builder.to_dict())
 
                             # Refresh active_artifact after tools that create/edit artifacts

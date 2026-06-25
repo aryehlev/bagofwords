@@ -591,6 +591,9 @@ class QueryCapturingClientWrapper:
             getattr(self._original, "_bow_data_source_id", "") or "",
             getattr(self._original, "_bow_connection_id", "") or "",
             self._client_key or getattr(self._original, "_bow_client_key", "") or "",
+            # Per-user identity for user_required/delegated connections so two users
+            # sharing one connection never share cached rows (empty for shared creds).
+            getattr(self._original, "_bow_cache_identity", "") or "",
         ))
 
     def _cache_get(self, query):

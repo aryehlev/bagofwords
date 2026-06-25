@@ -89,7 +89,7 @@ def analyze(sql: str) -> QueryShape:
     if single_table:
         no_row_changing_clause = all(
             tree.find(node) is None
-            for node in (exp.Where, exp.Group, exp.Having, exp.Qualify, exp.Limit, exp.Distinct)
+            for node in (exp.Where, exp.Group, exp.Having, exp.Qualify, exp.Limit, exp.Offset, exp.Distinct)
         )
         # No aggregate or window functions in the projection.
         no_agg = not any(

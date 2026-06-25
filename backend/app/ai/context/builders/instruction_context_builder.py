@@ -459,13 +459,18 @@ class InstructionContextBuilder:
             query, [str(i.id) for i in all_instructions]
         )
 
-        # Score and filter by keyword/semantic match (or include all if no query)
+        # Score and filter by keyword/semantic match (or include all if no query).
+        # Gate the "no query" branch on the raw query text, not on derived
+        # keywords/scores: an all-stopword/punctuation query with semantic search
+        # unavailable still IS a query, and must not fall through to returning
+        # every intelligent instruction with score 0.0.
+        has_query = bool(query and query.strip())
         scored: List[Tuple[Instruction, float]] = []
         for instruction in all_instructions:
             keyword_score = self._score_instruction(instruction, keywords) if keywords else 0.0
             sem = sem_scores.get(str(instruction.id)) if sem_scores else None
             score = self._blend_semantic(keyword_score, sem)
-            if keywords or sem_scores:
+            if has_query:
                 if score > 0:
                     scored.append((instruction, score))
             else:

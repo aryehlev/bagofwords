@@ -21,11 +21,14 @@ from typing import List, Optional, Tuple
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from app.settings.database import create_async_session_factory
 from app.models.organization import Organization
 from app.models.instruction import Instruction
+from app.models.instruction_build import InstructionBuild
+from app.models.instruction_version import InstructionVersion
+from app.models.build_content import BuildContent
 from app.models.step import Step
 from app.models.widget import Widget
 from app.models.report import Report
@@ -67,10 +70,27 @@ async def _chunked_index(ss: SemanticSearch, owner_type: str,
 async def backfill_org(session, org: Organization, days: int, batch_size: int) -> None:
     ss = SemanticSearch(session, org)
 
+    # Embed the text that is LIVE in the org's main build (BuildContent ->
+    # InstructionVersion), not the mutable Instruction.text row, which can hold an
+    # unpromoted draft edit. This matches what semantic ranking sees for main-build
+    # candidates and what BuildService.promote_build re-embeds on promotion. Falls
+    # back to the row text when the version has no snapshot text.
     inst_rows = (
         await session.execute(
-            select(Instruction.id, Instruction.text).where(
+            select(Instruction.id, func.coalesce(InstructionVersion.text, Instruction.text))
+            .join(BuildContent, BuildContent.instruction_id == Instruction.id)
+            .join(
+                InstructionBuild,
+                (InstructionBuild.id == BuildContent.build_id)
+                & (InstructionBuild.is_main == True),  # noqa: E712
+            )
+            .join(
+                InstructionVersion,
+                InstructionVersion.id == BuildContent.instruction_version_id,
+            )
+            .where(
                 Instruction.organization_id == org.id,
+                InstructionBuild.organization_id == org.id,
                 Instruction.status == "published",
                 Instruction.deleted_at.is_(None),
             )
