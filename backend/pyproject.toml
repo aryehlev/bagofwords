@@ -153,3 +153,11 @@ known-first-party = ["app"]
 
 [tool.ty]
 python-version = "3.12"
+
+[tool.uv]
+# fastembed (used only for text embeddings in vector retrieval) caps its
+# transitive pillow dependency at <12.0, but we deliberately pin pillow to
+# 12.2.x to clear the Snyk findings flagged for older releases (see .snyk).
+# pillow is not exercised by fastembed's text-embedding path, so override the
+# transitive cap to keep the security pin and let resolution succeed.
+override-dependencies = ["pillow>=12.2.0,<12.3"]
