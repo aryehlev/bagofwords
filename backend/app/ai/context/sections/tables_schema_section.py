@@ -310,7 +310,7 @@ class TablesSchemaContext(ContextSection):
             payload = xml_tag("count", str(len(self.tables or []))) + xml_tag("top", ", ".join(first_five))
             return xml_tag(self.tag_name, payload, {"name": self.info.name, "type": self.info.type, "id": self.info.id})
 
-        def _render_topk_tables_full(self, top_k: int) -> str:
+        def _render_topk_tables_full(self, top_k: int, stable: bool = False) -> str:
             """Render top K tables with full schema, grouped by connection if multi-connection."""
             top_tables = (self.tables or [])[: max(0, top_k)]
             if not top_tables:
@@ -354,16 +354,23 @@ class TablesSchemaContext(ContextSection):
                     attrs["type"] = "semantic_view"
                 if getattr(t, 'description', None):
                     attrs["description"] = t.description
-                try:
-                    if getattr(t, 'score', None) is not None:
-                        attrs["score"] = str(round(float(getattr(t, 'score')), 2))
-                except Exception:
-                    pass
-                try:
-                    if getattr(t, 'usage_count', None) is not None:
-                        attrs["usage"] = str(int(getattr(t, 'usage_count') or 0))
-                except Exception:
-                    pass
+                # `score`/`usage` are volatile (they drift every turn as usage
+                # stats accrue) and would bust the prompt cache on the always-on
+                # schema block. In `stable` mode we omit them — the tables are
+                # still emitted in score-ranked ORDER, so the relevance signal is
+                # preserved without the churn. describe_tables (stable=False)
+                # keeps the raw numbers for on-demand inspection.
+                if not stable:
+                    try:
+                        if getattr(t, 'score', None) is not None:
+                            attrs["score"] = str(round(float(getattr(t, 'score')), 2))
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(t, 'usage_count', None) is not None:
+                            attrs["usage"] = str(int(getattr(t, 'usage_count') or 0))
+                    except Exception:
+                        pass
                 try:
                     if getattr(t, 'referenced_instructions_count', None) is not None:
                         attrs["instructions"] = str(int(getattr(t, 'referenced_instructions_count')))
@@ -413,7 +420,7 @@ class TablesSchemaContext(ContextSection):
                 tables_xml = [render_table(t) for t in top_tables]
                 return xml_tag("tables", "\n".join(tables_xml))
 
-        def _render_names_index(self, index_limit: int = 200) -> str:
+        def _render_names_index(self, index_limit: int = 200, stable: bool = False) -> str:
             tables = list(self.tables or [])
             if not tables:
                 return ""
@@ -425,11 +432,14 @@ class TablesSchemaContext(ContextSection):
                     "name": t.name,
                     "cols": str(len(getattr(t, 'columns', []) or [])),
                 }
-                try:
-                    if getattr(t, 'score', None) is not None:
-                        attrs["score"] = str(round(float(getattr(t, 'score')), 2))
-                except Exception:
-                    pass
+                # See note in _render_topk_tables_full: omit volatile `score` in
+                # stable mode to keep the cached schema block byte-identical.
+                if not stable:
+                    try:
+                        if getattr(t, 'score', None) is not None:
+                            attrs["score"] = str(round(float(getattr(t, 'score')), 2))
+                    except Exception:
+                        pass
                 try:
                     if getattr(t, 'referenced_instructions_count', None) is not None:
                         attrs["instructions"] = str(int(getattr(t, 'referenced_instructions_count')))
@@ -458,11 +468,17 @@ class TablesSchemaContext(ContextSection):
             return xml_tag(self.tag_name, "".join(ds._render_digest() for ds in self.data_sources or []))
         return xml_tag(self.tag_name, "\n\n".join(ds.render() for ds in self.data_sources or []))
 
-    def render_combined(self, top_k_per_ds: int = 10, index_limit: int = 200, include_index: bool = True) -> str:
+    def render_combined(self, top_k_per_ds: int = 10, index_limit: int = 200, include_index: bool = True, stable: bool = False) -> str:
+        """Render the combined per-data-source schema (top-K sample + names index).
+
+        ``stable=True`` omits volatile per-table metrics (score/usage) so the
+        output is byte-identical across turns when table membership is unchanged
+        — required for the always-on schema block to hit the prompt cache.
+        """
         ds_chunks: List[str] = []
         for ds in (self.data_sources or []):
-            sample_xml = ds._render_topk_tables_full(top_k_per_ds)
-            index_xml = ds._render_names_index(index_limit) if include_index else ""
+            sample_xml = ds._render_topk_tables_full(top_k_per_ds, stable=stable)
+            index_xml = ds._render_names_index(index_limit, stable=stable) if include_index else ""
             # Render MCP tools for this data source
             mcp_xml = ds._render_mcp_tools_xml() if ds.mcp_tools else ""
             if not (sample_xml or index_xml or mcp_xml):
