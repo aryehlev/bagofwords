@@ -2,7 +2,6 @@ import { defineNuxtConfig } from "nuxt/config"
 
 export default defineNuxtConfig({
   devtools: { enabled: true },
-  telemetry: false, // disable Nuxt's own usage telemetry (local/private use)
   ssr: false,
 
   modules: [
@@ -191,10 +190,7 @@ export default defineNuxtConfig({
       enableRefreshPeriodically: false
     },
     globalAppMiddleware: {
-      // Keep the global auth guard enabled in production; only disable it in
-      // development (the custom *.global.ts middleware handle post-auth checks
-      // but do not enforce authentication themselves).
-      isEnabled: process.env.NODE_ENV === 'production'
+      isEnabled: true
     },
     rewriteRedirects: true,
     fullPathRedirect: true

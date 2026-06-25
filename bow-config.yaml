@@ -2,11 +2,6 @@
 base_url: http://0.0.0.0:3000
 
 
-# Telemetry (PostHog usage analytics) — disabled for local use
-telemetry:
-  enabled: false
-
-
 # Feature Flags
 features:
   allow_uninvited_signups: false
@@ -72,9 +67,10 @@ google_oauth:
 encryption_key: ${BOW_ENCRYPTION_KEY}
 
 intercom:
-  enabled: false
+  enabled: true
 
-# (telemetry disabled at top of file; duplicate block removed so it can't override)
+telemetry:
+  enabled: true
 
 swagger:
   enabled: false
