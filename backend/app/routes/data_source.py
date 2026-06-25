@@ -73,6 +73,43 @@ async def get_data_source(
     return await data_source_service.get_data_source(db, data_source_id, organization, current_user)
 
 
+@router.post("/data_sources/{data_source_id}/profile", response_model=dict)
+@requires_resource_permission('data_source', 'view')
+async def profile_data_source_endpoint(
+    data_source_id: str,
+    table_limit: Optional[int] = None,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(current_user),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Trigger query-intelligence data profiling for a data source.
+
+    Samples each active table to learn value dictionaries, join keys, uniqueness
+    and row counts (persisted as TableProfile rows) which then feed query
+    generation. Read-only against the source; safe to re-run (upserts).
+    """
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+    from app.ai.query_intelligence.config import get_qi_config
+    from app.services.query_intelligence_service import profile_data_source
+
+    cfg = get_qi_config()
+    if not cfg.enabled:
+        raise HTTPException(status_code=409, detail="Query intelligence is disabled (set BOW_QUERY_INTEL_ENABLED=1).")
+
+    stmt = (
+        select(DataSource)
+        .where(DataSource.id == data_source_id, DataSource.organization_id == str(organization.id))
+        .options(selectinload(DataSource.connections))
+    )
+    ds = (await db.execute(stmt)).scalar_one_or_none()
+    if ds is None:
+        raise HTTPException(status_code=404, detail="Data source not found")
+
+    summary = await profile_data_source(db, ds, config=cfg, table_limit=table_limit)
+    return {"data_source_id": data_source_id, **summary}
+
+
 @router.get("/data_sources/{data_source_type}/fields", response_model=dict)
 async def get_data_source_fields(
     data_source_type: str,

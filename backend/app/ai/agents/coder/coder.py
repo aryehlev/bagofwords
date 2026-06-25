@@ -475,6 +475,13 @@ class Coder:
             {schemas}
             </ground_truth_schemas>
 
+            - Learned Data Profile (sampled from real rows — prefer these real literal
+              values for filters, use the listed join keys, and treat tables marked
+              SLOW carefully by filtering early and avoiding SELECT *):
+            <data_profile>
+            {context.data_profile_context or "No profile available."}
+            </data_profile>
+
             - Resources:
             {resources_context}
 
