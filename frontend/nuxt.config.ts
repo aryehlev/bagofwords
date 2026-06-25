@@ -2,7 +2,6 @@ import { defineNuxtConfig } from "nuxt/config"
 
 export default defineNuxtConfig({
   devtools: { enabled: true },
-  telemetry: false, // disable Nuxt's own usage telemetry (local/private use)
   ssr: false,
 
   modules: [
