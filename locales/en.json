@@ -414,7 +414,8 @@
     "duration": "Duration: {ms}ms",
     "widgetRef": "→ Widget: {id}",
     "stepRef": "→ Step: {id}",
-    "viewAgentTrace": "View Agent Trace"
+    "viewAgentTrace": "View Agent Trace",
+    "followUp": "Follow up"
   },
   "tools": {
     "common": {
@@ -1138,6 +1139,12 @@
       "saved": "Language updated",
       "saveError": "Could not update language"
     },
+    "timezone": {
+      "label": "Organization timezone",
+      "description": "Used to interpret scheduled jobs (e.g. reindex times) and to display timestamps. Data is always stored in UTC.",
+      "systemDefault": "Use system default (UTC)",
+      "saveError": "Could not update timezone"
+    },
     "workspacePlaceholder": "Workspace name",
     "changeIcon": "Change Icon",
     "uploadIconButton": "Upload Icon",
@@ -1381,6 +1388,14 @@
     "autoReindexEnterprise": "Scheduled reindexing is an enterprise feature.",
     "autoReindexEvery": "Reindex every",
     "everyNHours": "Every {n} hours",
+    "autoReindexSchedule": "Schedule",
+    "autoReindexModeInterval": "Interval",
+    "autoReindexModeTime": "At time",
+    "autoReindexAt": "Reindex daily at",
+    "autoReindexTimeHint": "Daily, in the organization timezone.",
+    "autoReindexMinInterval": "Minimum interval is {n} minutes.",
+    "unitMinutes": "minutes",
+    "unitHours": "hours",
     "autoReindexLastError": "Last error",
     "autoReindexSaveFailed": "Failed to save auto-reindex settings"
   },
@@ -1975,6 +1990,42 @@
     "title": "Monitoring",
     "tabExplore": "Explore",
     "tabDiagnosis": "Diagnosis",
+    "tabCost": "Cost",
+    "cost": {
+      "title": "Cost",
+      "subtitle": "LLM token and cost spend over time",
+      "groupBy": "Group by",
+      "groupByModel": "Model",
+      "groupByProvider": "Provider",
+      "groupByUser": "User",
+      "groupByDataSource": "Agent (data source)",
+      "groupByGroup": "Group",
+      "groupByScope": "Feature (scope)",
+      "metricCost": "Cost",
+      "metricTokens": "Tokens",
+      "exportCsv": "Export CSV",
+      "kpiTotalCost": "Total cost",
+      "kpiTotalTokens": "Total tokens",
+      "kpiTotalCalls": "LLM calls",
+      "kpiAvgCostPerCall": "Avg cost / call",
+      "estimated": "estimated",
+      "estimatedNote": "Some spend is estimated (custom / Azure / Bedrock providers have no first-party price feed).",
+      "trendTitle": "Spend over time",
+      "breakdownTitle": "Breakdown",
+      "colName": "Name",
+      "colCalls": "Calls",
+      "colTokens": "Tokens",
+      "colInputCost": "Input cost",
+      "colOutputCost": "Output cost",
+      "colTotalCost": "Total cost",
+      "colShare": "Share",
+      "unattributed": "Unattributed",
+      "noData": "No LLM usage in this period",
+      "loading": "Loading cost data...",
+      "lockedTitle": "Cost is an enterprise feature",
+      "lockedBody": "Upgrade to an enterprise license to track LLM token and cost spend by user, agent and group over time.",
+      "fanoutNote": "Spend for multi-source reports is counted for each of their data sources, so per-row totals can exceed the headline total."
+    },
     "cards": {
       "messages": "Messages",
       "queries": "Queries",
@@ -2333,6 +2384,60 @@
     "genericTitle": "Something went wrong",
     "unknownError": "Unknown error",
     "goHome": "Go home"
+  },
+  "profile": {
+    "menuItem": "Profile",
+    "nav": {
+      "general": "General",
+      "instructions": "Custom Instructions",
+      "usage": "Usage",
+      "appearance": "Appearance"
+    },
+    "general": {
+      "title": "General",
+      "subtitle": "Your personal details and connected platforms.",
+      "fullName": "Full name",
+      "fullNamePlaceholder": "Your name",
+      "email": "Email",
+      "saved": "Profile updated",
+      "saveFailed": "Failed to update profile",
+      "removePhoto": "Remove photo",
+      "avatarUpdated": "Photo updated",
+      "avatarFailed": "Failed to update photo",
+      "avatarTooLarge": "Image is too large (max 5 MB)",
+      "platforms": "External platforms",
+      "platformsSubtitle": "Accounts linked to your profile across integrations.",
+      "connected": "Connected",
+      "pending": "Pending",
+      "noPlatforms": "No external platforms connected yet."
+    },
+    "instructions": {
+      "title": "Custom Instructions",
+      "subtitle": "Tell the AI about yourself — your role and what you care about. It's shared with the AI when it works on your behalf in this organization.",
+      "placeholder": "e.g. I'm the CEO. I focus on revenue and growth — keep answers high-level and concise, and show figures in USD.",
+      "saved": "Instructions saved",
+      "saveFailed": "Failed to save instructions"
+    },
+    "usage": {
+      "title": "Usage",
+      "subtitle": "Your activity for the current billing window.",
+      "tokens": "Tokens",
+      "queries": "Queries",
+      "data": "Data scanned",
+      "windowNote": "Usage resets at the start of each month.",
+      "disabledTitle": "Usage tracking isn't enabled",
+      "disabledNote": "Per-user usage (tokens, queries, and data scanned) is tracked when the Usage Limits feature is enabled on your plan."
+    },
+    "appearance": {
+      "title": "Appearance",
+      "subtitle": "Customize how the app looks for you.",
+      "theme": "Theme",
+      "light": "Light",
+      "dark": "Dark",
+      "system": "System",
+      "language": "Language",
+      "languageDescription": "Overrides the organization's default language for your account only."
+    }
   },
   "agentPage": {
     "tables": {

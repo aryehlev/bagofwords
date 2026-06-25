@@ -51,6 +51,17 @@ class LLMClient(ABC):
         if False:  # pragma: no cover
             yield  # type: ignore[misc]
 
+    async def embed(self, model_id: str, texts: list[str]) -> list[list[float]]:
+        """Embed a batch of texts, returning one vector per input.
+
+        Default raises NotImplementedError so providers opt in incrementally
+        (mirrors ``inference_stream_v2``). Implemented by providers that expose a
+        text-embedding endpoint (OpenAI, Azure, Google, Bedrock).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement embed"
+        )
+
     def _set_last_usage(self, usage: LLMUsage):
         self._last_usage = usage or LLMUsage()
 

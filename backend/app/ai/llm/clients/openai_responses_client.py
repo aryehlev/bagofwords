@@ -59,6 +59,23 @@ class OpenAIResponsesClient(LLMClient):
         self.async_client = AsyncOpenAI(**client_kwargs)
         self.enable_web_search = enable_web_search
 
+    async def embed(self, model_id: str, texts: list[str]) -> list[list[float]]:
+        """Embed via the OpenAI embeddings endpoint, preserving input order.
+
+        Embeddings live under the same client used for chat/responses, so the
+        default-OpenAI and Azure-responses paths both get embeddings here.
+        """
+        if not texts:
+            return []
+        resp = await self.async_client.embeddings.create(model=model_id, input=texts)
+        items = sorted(resp.data, key=lambda d: d.index)
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            self._set_last_usage(
+                LLMUsage(prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0))
+            )
+        return [list(map(float, item.embedding)) for item in items]
+
     @staticmethod
     def _build_chat_content(prompt: str, images: Optional[list[ImageInput]] = None):
         if not images:

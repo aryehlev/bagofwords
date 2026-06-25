@@ -45,7 +45,10 @@ def _setup_test_database():
         from testcontainers.postgres import PostgresContainer
 
         print("🐘 Starting PostgreSQL container...")
-        _postgres_container = PostgresContainer("postgres:15")
+        # pgvector/pgvector:pg15 is the stock postgres:15 image with the
+        # `vector` extension preinstalled — the embeddings migration runs
+        # `CREATE EXTENSION vector`, which vanilla postgres:15 cannot satisfy.
+        _postgres_container = PostgresContainer("pgvector/pgvector:pg15")
         _postgres_container.start()
 
         # Get connection URL and set as environment variable BEFORE settings loads

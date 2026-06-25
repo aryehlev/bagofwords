@@ -97,6 +97,7 @@ from app.models.usage_policy import (
     UsageCounter,
     UsageEvent,
 )
+from app.models.embedding import Embedding
 
 from app.settings.config import settings
 

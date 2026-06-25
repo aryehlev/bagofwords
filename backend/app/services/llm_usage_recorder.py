@@ -20,6 +20,10 @@ class LLMUsageRecorderService:
         completion_tokens: int = 0,
         cache_read_tokens: int = 0,
         cache_creation_tokens: int = 0,
+        organization_id: str | None = None,
+        user_id: str | None = None,
+        report_id: str | None = None,
+        data_source_id: str | None = None,
     ) -> LLMUsageRecord:
 
         provider_type = llm_model.provider.provider_type if llm_model.provider else ""
@@ -28,9 +32,20 @@ class LLMUsageRecorderService:
         )
         output_cost = self._calc_output_cost(llm_model, completion_tokens)
 
+        # Org is always knowable from the model itself; fall back to it when the
+        # caller didn't supply explicit attribution. The other dimensions stay
+        # NULL when unknown (e.g. background jobs not tied to a user/report).
+        org_id = organization_id or (
+            str(llm_model.organization_id) if getattr(llm_model, "organization_id", None) else None
+        )
+
         record = LLMUsageRecord(
             scope=scope,
             scope_ref_id=scope_ref_id,
+            organization_id=org_id,
+            user_id=user_id,
+            report_id=report_id,
+            data_source_id=data_source_id,
             llm_model_id=str(llm_model.id),
             model_id=llm_model.model_id,
             provider_type=provider_type,
@@ -74,6 +89,15 @@ class LLMUsageRecorderService:
             # but actually charge 0.5× for those tokens. Apply the 50% discount.
             if cache_read_tokens:
                 cost -= (cache_read_tokens / 1_000_000) * rate_f * 0.5
+        elif provider_type == "google":
+            # Gemini reports cached tokens inside prompt_token_count at full rate,
+            # but explicit-cache reads are billed at 0.25× the input rate — apply the
+            # 75% discount on the cached portion. Cache-creation tokens are a separate
+            # one-time charge at the full input rate.
+            if cache_read_tokens:
+                cost -= (cache_read_tokens / 1_000_000) * rate_f * 0.75
+            if cache_creation_tokens:
+                cost += (cache_creation_tokens / 1_000_000) * rate_f
         return max(cost, 0.0)
 
     @staticmethod

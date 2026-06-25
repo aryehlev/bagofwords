@@ -20,6 +20,7 @@ from .types import (
 )
 from app.ai.utils.token_counter import count_tokens, estimate_tokens_fast
 from app.models.llm_model import LLMModel
+from app.ai.llm.usage_attribution import get_usage_attribution
 from app.services.llm_usage_recorder import LLMUsageRecorderService
 from app.services.usage_policy_service import UsageLimitContext, usage_policy_service
 from app.settings.logging_config import get_logger
@@ -468,6 +469,72 @@ class LLM:
                 should_record=should_record,
             )
 
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        usage_scope: Optional[str] = "embedding",
+        usage_scope_ref_id: Optional[str] = None,
+        should_record: bool = True,
+    ) -> list[list[float]]:
+        """Embed a batch of texts via the active provider client.
+
+        Records prompt-token usage (embeddings are prompt-only) the same way the
+        inference paths do, when the client reports it.
+        """
+        if not texts:
+            return []
+        # Enforce quota guardrails up front, like the inference paths do, so
+        # embedding-heavy jobs can't bypass in-memory quota enforcement.
+        prompt_tokens_estimate = sum(self._estimate_tokens_fast(t) for t in texts)
+        await self._check_usage_limit_async(prompt_tokens_estimate, should_record=should_record)
+        with tracer.start_as_current_span("llm.embed") as span:
+            span.set_attribute("llm.model_id", self.model_id)
+            span.set_attribute("llm.provider", self.provider)
+            span.set_attribute("llm.embed_batch", len(texts))
+            # Drain any stale usage from a prior request so pop_last_usage()
+            # below can't misattribute it to this embed batch.
+            if hasattr(self.client, "pop_last_usage"):
+                self.client.pop_last_usage()
+            try:
+                vectors = await self.client.embed(model_id=self.model_id, texts=texts)
+            except NotImplementedError:
+                raise
+            except Exception as e:
+                span.set_status(StatusCode.ERROR, str(e))
+                span.record_exception(e)
+                raise RuntimeError(
+                    f"LLM embed failed (provider={self.provider}, model={self.model_id}): {e}"
+                ) from e
+            if len(vectors) != len(texts):
+                raise RuntimeError(
+                    f"LLM embed cardinality mismatch (provider={self.provider}, model={self.model_id}, "
+                    f"expected={len(texts)}, got={len(vectors)})"
+                )
+
+            prompt_tokens = 0
+            if hasattr(self.client, "pop_last_usage"):
+                prompt_tokens = self.client.pop_last_usage().prompt_tokens or 0
+            if not prompt_tokens:
+                prompt_tokens = prompt_tokens_estimate
+            span.set_attribute("llm.prompt_tokens", prompt_tokens)
+
+            self._schedule_usage_record(
+                scope=usage_scope,
+                scope_ref_id=usage_scope_ref_id,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
+                should_record=should_record,
+            )
+            await self._record_usage_limit_async(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
+                scope=usage_scope,
+                scope_ref_id=usage_scope_ref_id,
+                should_record=should_record,
+            )
+            return vectors
+
     async def test_connection(self, prompt: str = "Hello, how are you?"):
         logger.info("Testing LLM connection: provider=%s, model=%s", self.provider, self.model_id)
         try:
@@ -555,7 +622,11 @@ class LLM:
         cache_creation_tokens: int = 0,
     ) -> int:
         total = (prompt_tokens or 0) + (completion_tokens or 0)
-        if self.provider == "anthropic":
+        # Anthropic and Bedrock report cache read/write tokens SEPARATELY from
+        # the prompt token count, so they must be added in for an accurate quota.
+        # (Gemini/OpenAI fold cached tokens into prompt_tokens already — adding
+        # them here would double-count.)
+        if self.provider in ("anthropic", "bedrock"):
             total += (cache_read_tokens or 0) + (cache_creation_tokens or 0)
         return max(int(total), 0)
 
@@ -679,6 +750,11 @@ class LLM:
         if session_maker is None:
             return
 
+        # Snapshot attribution NOW, synchronously, while we're still in the LLM
+        # call's own context. The actual DB write runs on a background task /
+        # worker thread where the contextvar may not have propagated.
+        attribution = get_usage_attribution()
+
         async def _record_usage():
             try:
                 async with session_maker() as session:
@@ -691,6 +767,10 @@ class LLM:
                         completion_tokens=completion_tokens or 0,
                         cache_read_tokens=cache_read_tokens or 0,
                         cache_creation_tokens=cache_creation_tokens or 0,
+                        organization_id=attribution.get("organization_id"),
+                        user_id=attribution.get("user_id"),
+                        report_id=attribution.get("report_id"),
+                        data_source_id=attribution.get("data_source_id"),
                     )
                     await session.commit()
             except Exception as exc:

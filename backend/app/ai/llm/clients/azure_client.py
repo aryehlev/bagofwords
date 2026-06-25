@@ -35,6 +35,22 @@ class AzureClient(LLMClient):
             api_version=effective_api_version,
         )
 
+    async def embed(self, model_id: str, texts: list[str]) -> list[list[float]]:
+        """Embed via the Azure OpenAI embeddings deployment, preserving order.
+
+        ``model_id`` is the Azure deployment name for the embedding model.
+        """
+        if not texts:
+            return []
+        resp = await self.async_client.embeddings.create(model=model_id, input=texts)
+        items = sorted(resp.data, key=lambda d: d.index)
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            self._set_last_usage(
+                LLMUsage(prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0))
+            )
+        return [list(map(float, item.embedding)) for item in items]
+
     @staticmethod
     def _build_content(prompt: str, images: Optional[list[ImageInput]] = None) -> str | list[dict[str, Any]]:
         """Build message content, either as string or multimodal content array."""

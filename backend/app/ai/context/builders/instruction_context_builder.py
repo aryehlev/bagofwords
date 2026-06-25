@@ -17,6 +17,7 @@ from app.models.user import User
 from app.models.user_data_source_overlay import UserDataSourceTable
 
 from app.ai.context.sections.instructions_section import InstructionsSection, InstructionItem, InstructionLabelItem, SkillCatalogItem
+from app.ai.context.semantic_search import SemanticSearch
 
 logger = logging.getLogger(__name__)
 
@@ -453,17 +454,29 @@ class InstructionContextBuilder:
         # Filter by per-user table accessibility
         all_instructions = await self._filter_instructions_by_table_accessibility(all_instructions)
 
-        # Score and filter by keyword match (or include all if no keywords)
+        # Semantic scores over the candidate set (None = disabled).
+        sem_scores = await self._semantic_instruction_scores(
+            query, [str(i.id) for i in all_instructions]
+        )
+
+        # Score and filter by keyword/semantic match (or include all if no query).
+        # Gate the "no query" branch on the raw query text, not on derived
+        # keywords/scores: an all-stopword/punctuation query with semantic search
+        # unavailable still IS a query, and must not fall through to returning
+        # every intelligent instruction with score 0.0.
+        has_query = bool(query and query.strip())
         scored: List[Tuple[Instruction, float]] = []
         for instruction in all_instructions:
-            if keywords:
-                score = self._score_instruction(instruction, keywords)
+            keyword_score = self._score_instruction(instruction, keywords) if keywords else 0.0
+            sem = sem_scores.get(str(instruction.id)) if sem_scores else None
+            score = self._blend_semantic(keyword_score, sem)
+            if has_query:
                 if score > 0:
                     scored.append((instruction, score))
             else:
                 # No query - include all with score 0
                 scored.append((instruction, 0.0))
-        
+
         # Sort by score descending and limit
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored[:limit]
@@ -749,11 +762,18 @@ class InstructionContextBuilder:
         if remaining_slots > 0 and intelligent_contents:
             # Extract keywords from query for scoring
             keywords = self._extract_keywords(query) if query else set()
-            
+
+            # Semantic scores over the intelligent candidate set (None = disabled).
+            sem_scores = await self._semantic_instruction_scores(
+                query, [str(i.id) for _, i, _ in intelligent_contents]
+            )
+
             # Score and rank intelligent instructions
             scored: List[Tuple[InstructionItem, float]] = []
             for content, instruction, version in intelligent_contents:
-                score = self._score_instruction_version(version, keywords)
+                keyword_score = self._score_instruction_version(version, keywords)
+                sem = sem_scores.get(str(instruction.id)) if sem_scores else None
+                score = self._blend_semantic(keyword_score, sem)
                 # Include if score > 0 OR if we have no query (load all intelligent)
                 if score > 0 or not query:
                     inst_id = str(instruction.id)
@@ -1199,6 +1219,38 @@ class InstructionContextBuilder:
                     f"Excluding instruction {item.id} — all table refs inaccessible for user"
                 )
         return filtered
+
+    async def _semantic_instruction_scores(
+        self, query: str, instruction_ids: List[str]
+    ) -> Optional[Dict[str, float]]:
+        """Embedding similarity for candidate instructions, or None to skip.
+
+        Returns None whenever semantic search can't run, so callers keep the
+        keyword/Jaccard ranking unchanged.
+        """
+        if not query or not instruction_ids:
+            return None
+        try:
+            ss = SemanticSearch(self.db, self.organization, self.organization_settings)
+            return await ss.rank(
+                query,
+                owner_type="instruction",
+                top_k=len(instruction_ids),
+                candidate_ids=instruction_ids,
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _blend_semantic(keyword_score: float, sem_score: Optional[float]) -> float:
+        """Blend keyword and semantic scores (both in [0,1]).
+
+        When no semantic score is available, returns the keyword score so the
+        ranking is identical to the pre-semantic behavior.
+        """
+        if sem_score is None:
+            return keyword_score
+        return 0.5 * keyword_score + 0.5 * sem_score
 
     def _extract_keywords(self, text: str) -> Set[str]:
         """Extract meaningful keywords from text."""

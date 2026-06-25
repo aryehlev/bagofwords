@@ -311,6 +311,19 @@ Examples of good behavior:
   - Message: "Building the dashboard from the albums table."
   - Tool: create_artifact (reuses the existing viz_id)
 """
+        # Schema/table catalog lives in the SYSTEM prompt (not the per-turn user
+        # message) so it sits inside the cached prefix. Every provider caches the
+        # system block (Anthropic/Bedrock cache_control, Gemini CachedContent,
+        # OpenAI/Azure automatic), so the large, slow-changing schema is billed at
+        # the cache-read rate on iteration 2+ and on later turns when unchanged.
+        # It's rendered in `stable` mode upstream (no volatile score/usage attrs)
+        # so the block stays byte-identical across turns. Detail beyond the
+        # top-K + index is pulled on demand via describe_tables, which keeps the
+        # always-on payload small while the cache keeps re-sending it cheap.
+        schemas_combined = getattr(planner_input, "schemas_combined", None)
+        if schemas_combined:
+            system = f"{system}\n\n{schemas_combined}"
+
         # TEMP debug toggle: BOW_FORCE_PARALLEL_TOOLS=true relaxes the
         # one-tool-per-turn rule so the multi-tool dispatch loop can be
         # exercised end-to-end. Default behavior unchanged.
@@ -426,9 +439,9 @@ Examples of good behavior:
 
         # Per-turn timestamp — lives in the user message (which is below the
         # cache breakpoint) so it doesn't invalidate the cached system prefix.
-        now = datetime.now()
-        tz = now.astimezone().tzinfo
-        time_block = f"<time>{now.strftime('%Y-%m-%d %H:%M:%S')} ({tz})</time>"
+        # Rendered in the org timezone when configured (server-local fallback).
+        from app.ai.agents.planner.clock import time_block as _time_block
+        time_block = _time_block(planner_input.timezone)
 
         parts: List[str] = [time_block]
         user_profile_block = PromptBuilderV3._format_user_profile(planner_input)
@@ -442,8 +455,9 @@ Examples of good behavior:
         parts.append(f"  {PromptBuilder._format_platform_context(planner_input)}")
         if planner_input.instructions:
             parts.append(f"  {planner_input.instructions}")
-        if getattr(planner_input, "schemas_combined", None):
-            parts.append(f"  {planner_input.schemas_combined}")
+        # NOTE: schemas_combined is intentionally NOT emitted here — it now lives
+        # in the cached system prompt (see _build_system) so it's billed at the
+        # cache-read rate instead of re-sent at full price in every user turn.
         if getattr(planner_input, "files_context", None):
             parts.append(f"  {planner_input.files_context}")
         if getattr(planner_input, "resources_combined", None):

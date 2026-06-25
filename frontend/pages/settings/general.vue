@@ -1,7 +1,7 @@
 <template>
     <div class="mt-6">
-        <h2 class="text-lg font-medium text-gray-900">{{ $t('settings.general') }}
-            <p class="text-sm text-gray-500 font-normal mb-8">
+        <h2 class="text-lg font-medium text-gray-900 dark:text-white">{{ $t('settings.general') }}
+            <p class="text-sm text-gray-500 dark:text-gray-400 font-normal mb-8">
                 {{ $t('settings.subtitle') }}
             </p>
         </h2>
@@ -17,16 +17,16 @@
         <div v-if="!loading && !error" class="space-y-6">
             <!-- Organization Name -->
             <div class="md:w-2/3 space-y-2">
-                <div class="text-sm font-medium text-gray-800">{{ $t('settings.organizationName') }}</div>
+                <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.organizationName') }}</div>
                 <UInput v-model="form.organization_name" :maxlength="80" :placeholder="$t('settings.workspacePlaceholder')" />
             </div>
             <!-- Organization Icon -->
             <div class="md:w-2/3 space-y-2">
-                <div class="text-sm font-medium text-gray-800">{{ $t('settings.organizationIcon') }}</div>
+                <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.organizationIcon') }}</div>
                 <div class="flex items-center space-x-4">
-                    <div class="w-20 h-14 rounded border bg-white overflow-hidden flex items-center justify-center">
+                    <div class="w-20 h-14 rounded border bg-white dark:bg-gray-900 overflow-hidden flex items-center justify-center">
                         <img v-if="form.icon_url" :src="form.icon_url" class="max-w-full max-h-full object-contain" />
-                        <Icon v-else name="heroicons:building-office" class="w-6 h-6 text-gray-400" />
+                        <Icon v-else name="heroicons:building-office" class="w-6 h-6 text-gray-400 dark:text-gray-400" />
                     </div>
                     <div class="space-x-2">
                         <UButton size="sm" variant="outline" color="blue" @click="selectIcon">{{ form.icon_url ? $t('settings.changeIcon') : $t('settings.uploadIconButton') }}</UButton>
@@ -34,33 +34,46 @@
                         <input ref="fileInput" type="file" accept="image/*" class="hidden" @change="onIconSelected" />
                     </div>
                 </div>
-                <div class="text-xs text-gray-500">{{ $t('settings.iconConstraints') }}</div>
+                <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.iconConstraints') }}</div>
             </div>
 
 
 
             <!-- AI Analyst Name -->
             <div class="md:w-2/3 space-y-2">
-                <div class="text-sm font-medium text-gray-800">{{ $t('settings.aiAnalystName') }}</div>
+                <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.aiAnalystName') }}</div>
                 <UInput v-model="form.ai_analyst_name" :maxlength="50" placeholder="AI Analyst" />
             </div>
 
             <!-- Credit toggle -->
             <div class="md:w-2/3 flex items-center justify-between">
-                <div class="text-sm text-gray-800">{{ $t('settings.showCredit') }}</div>
+                <div class="text-sm text-gray-800 dark:text-gray-200">{{ $t('settings.showCredit') }}</div>
                 <UToggle v-model="form.bow_credit" />
             </div>
 
             <!-- Organization language -->
             <div class="md:w-2/3 space-y-2">
-                <div class="text-sm font-medium text-gray-800">{{ $t('settings.language.label') }}</div>
+                <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.language.label') }}</div>
                 <USelect
                     v-model="form.locale"
                     :options="localeOptions"
                     option-attribute="label"
                     value-attribute="value"
                 />
-                <div class="text-xs text-gray-500">{{ $t('settings.language.description') }}</div>
+                <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.language.description') }}</div>
+            </div>
+
+            <!-- Organization timezone -->
+            <div class="md:w-2/3 space-y-2">
+                <div class="text-sm font-medium text-gray-800">{{ $t('settings.timezone.label') }}</div>
+                <USelect
+                    v-model="form.timezone"
+                    :options="timezoneOptions"
+                    option-attribute="label"
+                    value-attribute="value"
+                    searchable
+                />
+                <div class="text-xs text-gray-500">{{ $t('settings.timezone.description') }}</div>
             </div>
 
             <div class="md:w-2/3 pt-2">
@@ -114,16 +127,20 @@ definePageMeta({ auth: true, permissions: ['manage_settings'], layout: 'settings
 const loading = ref(true)
 const error = ref('')
 const general = ref<GeneralConfig>({ ai_analyst_name: 'AI Analyst', bow_credit: true })
-const form = ref<{ organization_name?: string; locale: string } & GeneralConfig>({
+const form = ref<{ organization_name?: string; locale: string; timezone: string } & GeneralConfig>({
     ai_analyst_name: 'AI Analyst',
     bow_credit: true,
     locale: '',
+    timezone: '',
 })
 // Empty string represents "no org override" (system default). Tracking the
 // initial value lets saveAll skip the PUT when the user hasn't touched it.
 const initialLocale = ref<string>('')
 const enabledLocales = ref<string[]>([])
 const systemDefaultLocale = ref<string>('en')
+// Timezone: '' === no override (UTC). Track initial to skip an untouched PUT.
+const initialTimezone = ref<string>('')
+const supportedTimezones = ref<string[]>([])
 const pendingIconFile = ref<File | null>(null)
 const removeIcon = ref(false)
 const saving = ref(false)
@@ -141,13 +158,23 @@ const localeOptions = computed(() => {
     return opts
 })
 
+const timezoneOptions = computed(() => {
+    const opts = [{ label: t('settings.timezone.systemDefault'), value: '' }]
+    for (const tz of supportedTimezones.value) {
+        opts.push({ label: tz, value: tz })
+    }
+    return opts
+})
+
 const fetchSettings = async () => {
     loading.value = true
     error.value = ''
     try {
-        const [settingsResp, localeResp] = await Promise.all([
+        const [settingsResp, localeResp, tzResp, tzListResp] = await Promise.all([
             useMyFetch('/api/organization/settings'),
             useMyFetch('/api/organization/locale'),
+            useMyFetch('/api/organization/timezone'),
+            useMyFetch('/api/organization/timezones'),
         ])
         if (settingsResp.status.value !== 'success') throw new Error(settingsResp.error?.value?.data?.message || t('settings.failedToFetch'))
         const cfg = (settingsResp.data.value as SettingsResponse)?.config
@@ -159,9 +186,14 @@ const fetchSettings = async () => {
         systemDefaultLocale.value = loc?.default_locale ?? 'en'
         initialLocale.value = orgLocale
 
+        const tz = tzResp.data.value as { org_timezone?: string | null } | null
+        const orgTimezone = tz?.org_timezone ?? ''
+        initialTimezone.value = orgTimezone
+        supportedTimezones.value = (tzListResp.data.value as { timezones?: string[] } | null)?.timezones ?? []
+
         // Fetch current organization name from session if available
         const { organization } = useOrganization()
-        form.value = { organization_name: organization.value?.name, locale: orgLocale, ...general.value }
+        form.value = { organization_name: organization.value?.name, locale: orgLocale, timezone: orgTimezone, ...general.value }
     } catch (e: any) {
         error.value = e.message || t('settings.failedToLoad')
         toast.add({ title: t('common.error'), description: error.value, color: 'red' })
@@ -216,6 +248,14 @@ const saveAll = async () => {
             initialLocale.value = form.value.locale
         }
 
+        // 5) Save org timezone override (empty string clears it to UTC).
+        if (form.value.timezone !== initialTimezone.value) {
+            const tzBody = JSON.stringify({ timezone: form.value.timezone || null })
+            const tzResp = await useMyFetch('/api/organization/timezone', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: tzBody })
+            if (tzResp.status.value !== 'success') throw new Error(tzResp.error?.value?.data?.detail || t('settings.timezone.saveError'))
+            initialTimezone.value = form.value.timezone
+        }
+
         toast.add({ title: t('settings.saved'), color: 'green' })
         // reload to reflect icon in default layout
         window.location.reload()
@@ -254,5 +294,4 @@ const queueRemoveIcon = () => {
 
 onMounted(fetchSettings)
 </script>
-
 
