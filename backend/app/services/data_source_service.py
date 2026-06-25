@@ -1889,6 +1889,7 @@ class DataSourceService:
         try:
             setattr(client, "_bow_connection_id", str(connection.id))
             setattr(client, "_bow_connection_name", connection.name)
+            setattr(client, "_bow_connection_type", getattr(connection, "type", None))
             setattr(client, "_bow_data_source_id", str(data_source.id))
             setattr(client, "_bow_data_source_name", data_source.name)
             setattr(client, "_bow_client_key", client_key)

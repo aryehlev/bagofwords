@@ -850,6 +850,73 @@ Do not use generic placeholders like "value" unless that is the actual column na
             span.set_attribute("tables.resolved_count", sum(len(g.get("tables", [])) for g in resolved))
             return resolved, warnings
 
+    async def _load_data_sources_with_connections(self, runtime_ctx, resolved_tables):
+        """Load DataSource rows (with connections) for the resolved data source
+        ids. Returns [] on any failure — callers treat profiling as optional."""
+        db = runtime_ctx.get("db") if isinstance(runtime_ctx, dict) else None
+        if db is None:
+            return []
+        ds_ids = list({g.get("data_source_id") for g in (resolved_tables or []) if g.get("data_source_id")})
+        if not ds_ids:
+            return []
+        try:
+            from sqlalchemy import select
+            from sqlalchemy.orm import selectinload
+            from app.models.data_source import DataSource
+            stmt = (
+                select(DataSource)
+                .where(DataSource.id.in_(ds_ids))
+                .options(selectinload(DataSource.connections))
+            )
+            return list((await db.execute(stmt)).scalars().all())
+        except Exception as e:
+            logger.info("create_data: could not load data sources for profiling: %s", e)
+            return []
+
+    async def _build_data_profile_context(self, runtime_ctx, resolved_tables) -> str:
+        """Render the learned data profile for the resolved tables, or "" when
+        the feature is off / there is no profile yet."""
+        try:
+            from app.ai.query_intelligence.config import get_qi_config
+            cfg = get_qi_config()
+            if not (cfg.enabled and cfg.profile_in_prompt_enabled):
+                return ""
+            data_sources = await self._load_data_sources_with_connections(runtime_ctx, resolved_tables)
+            if not data_sources:
+                return ""
+            table_names = [t for g in (resolved_tables or []) for t in (g.get("tables") or [])]
+            from app.services.query_intelligence_service import get_profiles_for_tables
+            from app.ai.query_intelligence.profile_formatter import format_profiles
+            profiles = await get_profiles_for_tables(
+                runtime_ctx.get("db"), data_sources=data_sources, table_names=table_names or None
+            )
+            return format_profiles(profiles, config=cfg)
+        except Exception as e:
+            logger.info("create_data: profile context build failed: %s", e)
+            return ""
+
+    async def _record_query_costs(self, runtime_ctx, resolved_tables, executed_queries, query_timings):
+        """Fold this run's query timings back onto the table profiles. Fully
+        best-effort — swallows everything."""
+        try:
+            from app.ai.query_intelligence.config import get_qi_config
+            cfg = get_qi_config()
+            if not (cfg.enabled and cfg.cost_feedback_enabled) or not query_timings:
+                return
+            data_sources = await self._load_data_sources_with_connections(runtime_ctx, resolved_tables)
+            if not data_sources:
+                return
+            from app.services.query_intelligence_service import record_costs
+            await record_costs(
+                runtime_ctx.get("db"),
+                data_sources=data_sources,
+                executed_queries=executed_queries or [],
+                query_timings=query_timings or [],
+                config=cfg,
+            )
+        except Exception as e:
+            logger.info("create_data: cost recording failed: %s", e)
+
     @staticmethod
     def _summarize_errors(errors) -> dict:
         """Summarize retry errors for the planner observation.
@@ -1162,6 +1229,11 @@ Do not use generic placeholders like "value" unless that is the actual column na
             usage_context=usage_ctx,
         )
 
+        # Learned data profile (value dictionaries, join keys, cost) for the
+        # tables this turn touches — fed into generation. Best-effort: any
+        # failure (or the feature being disabled) yields an empty section.
+        data_profile_context = await self._build_data_profile_context(runtime_ctx, resolved_tables)
+
         # Build typed context via helper (use resolved active tables, not original patterns)
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "building_context"})
         codegen_context = await build_codegen_context(
@@ -1170,6 +1242,7 @@ Do not use generic placeholders like "value" unless that is the actual column na
             interpreted_prompt=(data.interpreted_prompt or None),
             schemas_excerpt=(schemas_excerpt or ""),
             tables_by_source=resolved_tables or None,
+            data_profile_context=data_profile_context,
         )
 
         # Combine schemas with files for additional grounding (keep previous semantics)
@@ -1338,6 +1411,10 @@ Do not use generic placeholders like "value" unless that is the actual column na
                 "row_count": len(exec_df) if exec_df is not None else 0,
             },
         )
+
+        # Runtime cost feedback: learn from how this run's queries actually
+        # performed so future generations get the SLOW/cost hints. Best-effort.
+        await self._record_query_costs(runtime_ctx, resolved_tables, executed_queries, query_timings)
 
         # Success path: format data and privacy-aware preview
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "formatting_widget"})

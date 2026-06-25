@@ -65,6 +65,7 @@ dependencies = [
     "pbixray>=0.5.2,<0.6",
     "pyarrow>=18.1.0,<18.2",
     "pandas>=2.3.3,<2.4",
+    "sqlglot>=25.0.0,<27",
     "numpy>=1.26.4,<1.27",
     "pgvector>=0.3.6,<0.4",
     "fastembed>=0.4.2,<0.5",
