@@ -937,6 +937,20 @@ async def current_user(
         if user is not None:
             return user
     
+    # Local dev auto-login: when BOW_DEV_AUTOLOGIN=1 and no credentials are
+    # present, authenticate as a fixed dev user so the app is usable without a
+    # login screen. Strictly env-gated so it is inert in production.
+    import os
+    if os.environ.get("BOW_DEV_AUTOLOGIN") == "1":
+        dev_email = os.environ.get("BOW_DEV_USER_EMAIL")
+        # Fail closed: only auto-login when an explicit dev email is provided.
+        # Never auto-select an arbitrary (possibly privileged) first user.
+        if dev_email:
+            result = await db.execute(select(User).where(User.email == dev_email))
+            dev_user = result.scalars().first()
+            if dev_user is not None:
+                return dev_user
+
     # No valid authentication
     raise HTTPException(
         status_code=401,
