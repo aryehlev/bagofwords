@@ -621,7 +621,11 @@ class LLM:
         cache_creation_tokens: int = 0,
     ) -> int:
         total = (prompt_tokens or 0) + (completion_tokens or 0)
-        if self.provider == "anthropic":
+        # Anthropic and Bedrock report cache read/write tokens SEPARATELY from
+        # the prompt token count, so they must be added in for an accurate quota.
+        # (Gemini/OpenAI fold cached tokens into prompt_tokens already — adding
+        # them here would double-count.)
+        if self.provider in ("anthropic", "bedrock"):
             total += (cache_read_tokens or 0) + (cache_creation_tokens or 0)
         return max(int(total), 0)
 
