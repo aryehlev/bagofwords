@@ -1,9 +1,9 @@
 <template>
-  <span v-if="!markdown" class="whitespace-pre-wrap text-[13px] leading-relaxed text-gray-900">
+  <span v-if="!markdown" class="whitespace-pre-wrap text-[13px] leading-relaxed text-gray-900 dark:text-white">
     <template v-for="(segment, i) in segments" :key="i">
       <span
         v-if="segment.ref || segment.mention"
-        class="inline-flex items-center gap-0.5 px-1 py-0.5 rounded bg-indigo-50 border border-indigo-100 text-[11px] font-sans font-medium text-indigo-700 align-baseline"
+        class="inline-flex items-center gap-0.5 px-1 py-0.5 rounded bg-indigo-50 dark:bg-indigo-950 border border-indigo-100 text-[11px] font-sans font-medium text-indigo-700 align-baseline"
       >
         <template v-if="segment.ref">
           <DataSourceIcon
@@ -238,5 +238,20 @@ const renderedHtml = computed(() => {
   font-weight: 500;
   font-size: 0.95em;
   white-space: nowrap;
+}
+
+/* Dark mode overrides. The `.dark` class lives on <html> (Tailwind darkMode:
+   'class'), outside this component's scope, so these rules are authored as
+   :global and matched by the unique `.instruction-prose` class. */
+:global(.dark .instruction-prose) { color: #e5e7eb; }
+:global(.dark .instruction-prose h1),
+:global(.dark .instruction-prose h2),
+:global(.dark .instruction-prose h3) { color: #f9fafb; }
+:global(.dark .instruction-prose code) { background: #374151; color: #e5e7eb; }
+:global(.dark .instruction-prose pre) { background: #1f2937; }
+:global(.dark .instruction-prose blockquote) { border-left-color: #374151; color: #9ca3af; }
+:global(.dark .instruction-prose .instruction-mention) {
+  background-color: rgba(129, 140, 248, 0.18);
+  color: #c7d2fe;
 }
 </style>
