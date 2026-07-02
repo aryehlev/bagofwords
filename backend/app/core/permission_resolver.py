@@ -32,8 +32,43 @@ ORG_PERM_IMPLIES_RESOURCE: dict[str, dict[str, set[str]]] = {
     "manage_instructions": {"data_source": {"manage_instructions"}},
     "manage_entities":     {"data_source": {"create_entities"}},
     "manage_evals":        {"data_source": {"manage_evals"}},
-    "manage_connections":  {"connection": {"manage_data_sources"}},
+    # Org connection-admin: manage every connection's config AND create agents
+    # on any connection. It is deliberately NOT `manage_data_sources` — managing
+    # *other people's* agents stays an explicit, opt-in per-connection grant.
+    "manage_connections":  {"connection": {"manage_connection", "create_data_sources"}},
 }
+
+# A `manage` grant on a data source is the agent-owner/manager tier: it is a
+# superset that implies the specific management permissions enforced across the
+# agent's surfaces (instructions, entities, evals, membership). This is what
+# lets a non-admin who creates/owns an agent fully manage *that* agent without
+# extra per-permission grants, while still scoping them to their own agents —
+# unlike the org-level `manage_*` perms which apply to every data source.
+RESOURCE_PERM_IMPLIES: dict[str, dict[str, set[str]]] = {
+    "data_source": {
+        "manage": {
+            "manage_instructions",
+            "create_entities",
+            "manage_evals",
+            "manage_members",
+            "view",
+            "view_schema",
+        },
+    },
+    "connection": {
+        # Managing all agents on a connection includes being able to create them.
+        "manage_data_sources": {"create_data_sources"},
+    },
+}
+
+
+def _grant_implies(resource_type: str, granted: set, permission: str) -> bool:
+    """True if any held resource grant implies `permission` (e.g. `manage`)."""
+    by_perm = RESOURCE_PERM_IMPLIES.get(resource_type, {})
+    for held in granted:
+        if permission in by_perm.get(held, set()):
+            return True
+    return False
 
 
 @dataclass
@@ -52,7 +87,9 @@ class ResolvedPermissions:
         """Check if user has a specific resource-level permission.
 
         Tiers: full_admin → implicit view/view_schema (any grant) →
-        org-perm implications (ORG_PERM_IMPLIES_RESOURCE) → explicit grant.
+        org-perm implications (ORG_PERM_IMPLIES_RESOURCE) → grant implications
+        (RESOURCE_PERM_IMPLIES, e.g. `manage` ⇒ manage_instructions) →
+        explicit grant.
         """
         if FULL_ADMIN in self.org_permissions:
             return True
@@ -68,8 +105,30 @@ class ResolvedPermissions:
             implied = ORG_PERM_IMPLIES_RESOURCE.get(org_perm, {}).get(resource_type)
             if implied and permission in implied:
                 return True
+        granted = self.resource_permissions.get(key, set())
+        # Implied by a superset grant on this resource (e.g. `manage`).
+        if _grant_implies(resource_type, granted, permission):
+            return True
         # Explicit grant
-        return permission in self.resource_permissions.get(key, set())
+        return permission in granted
+
+    def has_any_resource_permission(self, permission: str, resource_type: str | None = None) -> bool:
+        """True if the user holds `permission` on at least one resource, via an
+        explicit grant or a superset grant (e.g. `manage`).
+
+        Used by resource-scoped route gating as a cheap pre-filter before the
+        specific resource_id is checked in the route body — it must honour the
+        same grant implications as ``has_resource_permission`` so an agent
+        manager (holding only `manage`) isn't rejected at the door.
+        """
+        if FULL_ADMIN in self.org_permissions:
+            return True
+        for (rtype, _rid), perms in self.resource_permissions.items():
+            if resource_type is not None and rtype != resource_type:
+                continue
+            if permission in perms or _grant_implies(rtype, perms, permission):
+                return True
+        return False
 
     def has_resource_membership(self, resource_type: str, resource_id: str) -> bool:
         """Binary check — is user a member of this resource at all? (non-enterprise path)"""
@@ -77,6 +136,37 @@ class ResolvedPermissions:
             return True
         key = (resource_type, resource_id)
         return key in self.resource_permissions
+
+
+async def principal_belongs_to_org(db: AsyncSession, user, org_id: str) -> bool:
+    """Whether a principal is bound to an organization.
+
+    Humans are bound via a ``Membership`` row. Service accounts have no
+    ``Membership`` (so they consume no seat and never appear in member lists);
+    they are bound via a ``ServiceAccount`` row whose ``organization_id``
+    matches and which is not disabled/deleted.
+    """
+    from app.models.membership import Membership
+
+    if getattr(user, "is_service_account", False):
+        from app.models.service_account import ServiceAccount
+        result = await db.execute(
+            select(ServiceAccount).where(
+                ServiceAccount.user_id == str(user.id),
+                ServiceAccount.organization_id == str(org_id),
+                ServiceAccount.disabled_at.is_(None),
+                ServiceAccount.deleted_at.is_(None),
+            )
+        )
+        return result.scalar_one_or_none() is not None
+
+    result = await db.execute(
+        select(Membership).where(
+            Membership.user_id == str(user.id),
+            Membership.organization_id == str(org_id),
+        )
+    )
+    return result.scalar_one_or_none() is not None
 
 
 async def resolve_permissions(
@@ -91,8 +181,14 @@ async def resolve_permissions(
     4. Find all resource grants for user or their groups → resource_permissions
     5. Fallback to old Membership.role if no role_assignments exist (dual-read)
     """
+    memo = _rbac_memo(db)
+    if memo is not None and (user_id, org_id) in memo:
+        return memo[(user_id, org_id)]
     try:
-        return await _resolve_permissions_inner(db, user_id, org_id)
+        resolved = await _resolve_permissions_inner(db, user_id, org_id)
+        if memo is not None:
+            memo[(user_id, org_id)] = resolved
+        return resolved
     except Exception:
         logger.error(
             "Permission resolution failed for user=%s org=%s",
@@ -220,11 +316,193 @@ async def _resolve_permissions_inner(
         if isinstance(perms, list):
             resource_permissions[key].update(perms)
 
+    # Connection `manage_data_sources` grant ⇒ `manage` on every agent fully
+    # backed by those connections. Expanded here (rather than at check time) so
+    # the per-agent `manage` superset (instructions/entities/evals) and list
+    # visibility both work uniformly. Only EXPLICIT per-connection grants
+    # cascade — org `manage_connections` is connection-admin, not agent-admin.
+    managed_conn_ids = [
+        rid for (rtype, rid), perms in resource_permissions.items()
+        if rtype == "connection" and "manage_data_sources" in perms
+    ]
+    for ds_id in await _agents_fully_backed_by_connections(db, managed_conn_ids):
+        resource_permissions.setdefault(("data_source", ds_id), set()).add("manage")
+
     return ResolvedPermissions(
         org_permissions=org_permissions,
         resource_permissions=resource_permissions,
         role_names=role_names,
     )
+
+
+async def _agents_fully_backed_by_connections(
+    db: AsyncSession, connection_ids: list[str],
+) -> set[str]:
+    """Return data_source ids whose connections are ALL within ``connection_ids``.
+
+    ALL-connections semantics: an agent that draws on connections the caller
+    cannot fully manage is excluded, since it exposes data from every
+    connection it uses. Agents with no connections are excluded.
+    """
+    if not connection_ids:
+        return set()
+    from app.models.domain_connection import domain_connection
+
+    granted = set(connection_ids)
+    # Candidate agents: linked to at least one granted connection.
+    cand = await db.execute(
+        select(domain_connection.c.data_source_id)
+        .where(domain_connection.c.connection_id.in_(connection_ids))
+        .distinct()
+    )
+    candidate_ids = [r[0] for r in cand.all()]
+    if not candidate_ids:
+        return set()
+    # Pull every connection of those candidates; keep only fully-granted ones.
+    rows = await db.execute(
+        select(domain_connection.c.data_source_id, domain_connection.c.connection_id)
+        .where(domain_connection.c.data_source_id.in_(candidate_ids))
+    )
+    conns_by_ds: dict[str, set] = {}
+    for ds_id, conn_id in rows.all():
+        conns_by_ds.setdefault(ds_id, set()).add(conn_id)
+    return {ds_id for ds_id, conns in conns_by_ds.items() if conns and conns <= granted}
+
+
+async def resolve_permissions_bulk(
+    db: AsyncSession, user_id: str, org_ids: list[str]
+) -> dict[str, ResolvedPermissions]:
+    """Resolve permissions for a user across MANY orgs in a constant number of
+    queries (instead of ``resolve_permissions`` once per org).
+
+    whoami loops every org the user belongs to; calling ``resolve_permissions``
+    per org is ~3 queries × N orgs (serialized round-trips). This collapses the
+    group / role / grant lookups into three org-spanning queries and reconstructs
+    each org's ``ResolvedPermissions`` in Python, mirroring
+    ``_resolve_permissions_inner`` exactly. Returns a dict keyed by org id (every
+    requested org is present, empty perms if nothing matched).
+    """
+    result: dict[str, ResolvedPermissions] = {oid: ResolvedPermissions() for oid in org_ids}
+    if not org_ids:
+        return result
+    try:
+        # 1. Group memberships across all requested orgs (1 query).
+        group_rows = (await db.execute(
+            select(Group.organization_id, GroupMembership.group_id)
+            .join(Group, Group.id == GroupMembership.group_id)
+            .where(GroupMembership.user_id == user_id,
+                   Group.organization_id.in_(org_ids))
+        )).all()
+        groups_by_org: dict[str, list] = {}
+        all_group_ids: list = []
+        for org_id, group_id in group_rows:
+            groups_by_org.setdefault(org_id, []).append(group_id)
+            all_group_ids.append(group_id)
+
+        # 2. Role assignments + role data (1 query). Mirrors the per-org filter:
+        #    RoleAssignment.organization_id == org AND principal is the user or one
+        #    of the user's groups. Bucketed by org in Python.
+        role_principal = [and_(RoleAssignment.principal_type == "user",
+                               RoleAssignment.principal_id == user_id)]
+        if all_group_ids:
+            role_principal.append(and_(RoleAssignment.principal_type == "group",
+                                       RoleAssignment.principal_id.in_(all_group_ids)))
+        role_rows = (await db.execute(
+            select(RoleAssignment.organization_id, RoleAssignment.principal_type,
+                   RoleAssignment.principal_id, Role.id, Role.name, Role.permissions)
+            .join(RoleAssignment, RoleAssignment.role_id == Role.id)
+            .where(or_(*role_principal),
+                   RoleAssignment.organization_id.in_(org_ids),
+                   RoleAssignment.deleted_at.is_(None),
+                   Role.deleted_at.is_(None))
+        )).all()
+        org_perms: dict[str, set] = {oid: set() for oid in org_ids}
+        role_names_by_org: dict[str, list] = {oid: [] for oid in org_ids}
+        role_ids_by_org: dict[str, list] = {oid: [] for oid in org_ids}
+        for org_id, p_type, p_id, role_id, role_name, perms in role_rows:
+            if org_id not in org_perms:
+                continue
+            # Per-org principal check (a group id belongs to exactly one org).
+            if p_type == "group" and p_id not in groups_by_org.get(org_id, ()):
+                continue
+            role_ids_by_org[org_id].append(role_id)
+            role_names_by_org[org_id].append(role_name)
+            if isinstance(perms, list):
+                org_perms[org_id].update(perms)
+        all_role_ids = [rid for ids in role_ids_by_org.values() for rid in ids]
+
+        # 3. Resource grants (1 query) for user / groups / roles across all orgs.
+        grant_principal = [and_(ResourceGrant.principal_type == "user",
+                                ResourceGrant.principal_id == user_id)]
+        if all_group_ids:
+            grant_principal.append(and_(ResourceGrant.principal_type == "group",
+                                        ResourceGrant.principal_id.in_(all_group_ids)))
+        if all_role_ids:
+            grant_principal.append(and_(ResourceGrant.principal_type == "role",
+                                        ResourceGrant.principal_id.in_(all_role_ids)))
+        grant_rows = (await db.execute(
+            select(ResourceGrant.organization_id, ResourceGrant.principal_type,
+                   ResourceGrant.principal_id, ResourceGrant.resource_type,
+                   ResourceGrant.resource_id, ResourceGrant.permissions)
+            .where(or_(*grant_principal),
+                   ResourceGrant.organization_id.in_(org_ids),
+                   ResourceGrant.deleted_at.is_(None))
+        )).all()
+        res_perms_by_org: dict[str, dict] = {oid: {} for oid in org_ids}
+        for org_id, p_type, p_id, r_type, r_id, perms in grant_rows:
+            if org_id not in res_perms_by_org:
+                continue
+            if p_type == "group" and p_id not in groups_by_org.get(org_id, ()):
+                continue
+            if p_type == "role" and p_id not in role_ids_by_org.get(org_id, ()):
+                continue
+            key = (r_type, r_id)
+            bucket = res_perms_by_org[org_id]
+            if key not in bucket:
+                bucket[key] = set()
+            if isinstance(perms, list):
+                bucket[key].update(perms)
+
+        # 4. Expand connection manage_data_sources → per-agent manage. Rare (only
+        #    when the user holds explicit per-connection grants); ~free otherwise
+        #    (early return on empty). Kept per-org for exact parity.
+        for org_id in org_ids:
+            res_perms = res_perms_by_org[org_id]
+            managed_conn_ids = [rid for (rtype, rid), perms in res_perms.items()
+                                if rtype == "connection" and "manage_data_sources" in perms]
+            for ds_id in await _agents_fully_backed_by_connections(db, managed_conn_ids):
+                res_perms.setdefault(("data_source", ds_id), set()).add("manage")
+            result[org_id] = ResolvedPermissions(
+                org_permissions=org_perms[org_id],
+                resource_permissions=res_perms,
+                role_names=role_names_by_org[org_id],
+            )
+        # Warm the per-request memo so later single-org lookups are free.
+        memo = _rbac_memo(db)
+        if memo is not None:
+            for org_id, resolved in result.items():
+                memo[(user_id, org_id)] = resolved
+        return result
+    except Exception:
+        logger.error("Bulk permission resolution failed for user=%s", user_id, exc_info=True)
+        # Fall back to per-org resolution so a batch bug never denies access.
+        for org_id in org_ids:
+            result[org_id] = await resolve_permissions(db, user_id, org_id)
+        return result
+
+
+def _rbac_memo(db: AsyncSession):
+    """Per-request (per-session) memo dict for resolved permissions, or None.
+
+    Stored on the session's ``.info`` mapping, which lives for exactly one
+    request (the session is created per request via ``get_async_db``). This makes
+    repeated ``resolve_permissions`` calls for the same (user, org) within one
+    request free — several list endpoints resolve permissions 2-4× per request.
+    """
+    try:
+        return db.info.setdefault("_rbac_memo", {})
+    except Exception:
+        return None
 
 
 async def get_accessible_data_source_ids(
@@ -311,6 +589,60 @@ async def _resolved_member_ds_ids(
     return list(ds_ids)
 
 
+def llm_access_control_active() -> bool:
+    """Whether per-model LLM access control is enforced.
+
+    This is an enterprise feature. When the license does not include it, the
+    enforcement path fails OPEN — every model behaves as unrestricted, exactly
+    like the community build. This keeps a billing lapse from locking an org
+    out of its own models.
+    """
+    try:
+        from app.ee.license import has_feature
+        return has_feature("llm_access_control")
+    except Exception:
+        return False
+
+
+async def get_accessible_model_ids(
+    db: AsyncSession, user_id: str, org_id: str,
+) -> tuple[bool, list[str]]:
+    """Returns (is_admin, model_ids_the_user_holds_a `use` grant for).
+
+    - is_admin=True means the user has full_admin_access; callers should not
+      filter (every model is accessible).
+    - model_ids are LLMModel ids granted directly, via group, or via role.
+      Unrestricted models and org defaults are NOT included here — callers
+      handle those via ``user_can_use_model`` / the restriction flag.
+    """
+    resolved = await resolve_permissions(db, str(user_id), str(org_id))
+    if FULL_ADMIN in resolved.org_permissions:
+        return True, []
+    return False, [
+        rid for (rtype, rid), perms in resolved.resource_permissions.items()
+        if rtype == "llm_model" and "use" in perms
+    ]
+
+
+async def user_can_use_model(
+    db: AsyncSession, user_id: str, org_id: str, model,
+) -> bool:
+    """Capability check for a single LLM model.
+
+    Order: feature off (fail open) → unrestricted → org default/small-default
+    (always available) → full admin → explicit `use` grant.
+    """
+    if not llm_access_control_active():
+        return True
+    if not getattr(model, "is_restricted", False):
+        return True
+    # Org default + small default are always available to every member (D3).
+    if getattr(model, "is_default", False) or getattr(model, "is_small_default", False):
+        return True
+    is_admin, granted = await get_accessible_model_ids(db, user_id, org_id)
+    return is_admin or str(model.id) in set(granted)
+
+
 async def get_ds_ids_with_permission(
     db: AsyncSession, user_id: str, org_id: str, permission: str
 ) -> tuple[bool, list[str]]:
@@ -326,6 +658,43 @@ async def get_ds_ids_with_permission(
         if rtype == "data_source" and permission in perms
     ]
     return False, matching
+
+
+async def get_user_ids_with_permission(
+    db: AsyncSession, org_id: str, permission: str, data_source_id: str | None = None,
+) -> list[str]:
+    """Inverse of ``get_ds_ids_with_permission``: the user ids in an org who hold
+    ``permission`` — full admins always, plus (when ``data_source_id`` is given)
+    anyone with that permission on that specific agent/data source.
+
+    ``data_source_id=None`` => full admins only (a "global" item's audience).
+
+    Implemented by enumerating org members and reusing the forward resolver, so
+    it stays consistent with per-request permission checks. O(members) — fine for
+    the notification fan-out fired on discrete events; revisit with a set-based
+    query if it ever runs on a hot path.
+    """
+    from app.models.membership import Membership
+
+    rows = (await db.execute(
+        select(Membership.user_id).where(and_(
+            Membership.organization_id == str(org_id),
+            Membership.user_id.isnot(None),
+            Membership.deleted_at.is_(None),
+        ))
+    )).all()
+    out: list[str] = []
+    seen: set[str] = set()
+    target = str(data_source_id) if data_source_id is not None else None
+    for (uid,) in rows:
+        uid = str(uid)
+        if uid in seen:
+            continue
+        is_admin, ds_ids = await get_ds_ids_with_permission(db, uid, str(org_id), permission)
+        if is_admin or (target is not None and target in set(ds_ids)):
+            out.append(uid)
+            seen.add(uid)
+    return out
 
 
 async def user_can_access_data_source(

@@ -47,7 +47,7 @@ from app.core.telemetry import telemetry
 from app.ee.audit.service import audit_service
 from app.models.completion import Completion
 from app.models.report import Report
-from sqlalchemy import select, func, or_, and_
+from sqlalchemy import select, func, or_, and_, literal
 import re
 from datetime import datetime, timedelta
 import logging
@@ -524,6 +524,7 @@ class InstructionService:
         skip: int = 0,
         limit: int = 50,
         status: Optional[str] = None,
+        kind: Optional[str] = None,
         categories: Optional[List[str]] = None,
         include_own: bool = True,
         include_drafts: bool = False,
@@ -536,7 +537,9 @@ class InstructionService:
         label_ids: Optional[List[str]] = None,
         search: Optional[str] = None,
         build_id: Optional[str] = None,
-        include_global: bool = True
+        include_global: bool = True,
+        global_only: bool = False,
+        pending_only: bool = False,
     ) -> dict:
         """Get instructions with clean permission-based filtering. Returns paginated response.
         
@@ -573,8 +576,159 @@ class InstructionService:
             db, organization, conditions, status, categories, skip, limit,
             data_source_ids, source_types, load_modes, label_ids, search,
             build_id=build_id, include_global=include_global,
-            current_user=current_user,
+            current_user=current_user, kind=kind, global_only=global_only,
+            pending_only=pending_only,
         )
+
+    async def _visible_main_build_conditions(self, db, organization, current_user):
+        """Base WHERE conditions shared by the counts query and the list:
+        org-scoped, not deleted, in the main build, and visible to the caller
+        (global, or attached to a member/public data source). Mirrors
+        `_execute_instructions_query` so counts never disagree with the list."""
+        from app.models.instruction_build import InstructionBuild
+        from app.models.build_content import BuildContent
+        from app.core.permission_resolver import get_member_data_source_ids
+
+        conditions = [
+            Instruction.organization_id == organization.id,
+            Instruction.deleted_at == None,  # noqa: E711
+        ]
+        main_build_id = (await db.execute(
+            select(InstructionBuild.id).where(and_(
+                InstructionBuild.organization_id == organization.id,
+                InstructionBuild.is_main == True,  # noqa: E712
+                InstructionBuild.deleted_at == None,  # noqa: E711
+            ))
+        )).scalar_one_or_none()
+        if main_build_id:
+            conditions.append(Instruction.id.in_(
+                select(BuildContent.instruction_id).where(BuildContent.build_id == main_build_id)
+            ))
+        if current_user is not None:
+            member_ds_ids = await get_member_data_source_ids(
+                db, str(current_user.id), str(organization.id)
+            )
+            public_ds_subq = select(DataSource.id).where(and_(
+                DataSource.organization_id == organization.id,
+                DataSource.is_public == True,  # noqa: E712
+            ))
+            visible_clauses = [Instruction.data_sources.any(DataSource.id.in_(public_ds_subq))]
+            if member_ds_ids:
+                visible_clauses.append(Instruction.data_sources.any(DataSource.id.in_(member_ds_ids)))
+            conditions.append(or_(~Instruction.data_sources.any(), *visible_clauses))
+        return conditions
+
+    async def get_instruction_counts(self, db, organization, current_user) -> dict:
+        """Aggregate counts that drive the /agents tree badges WITHOUT hydrating
+        rows: global, skills, total pending, plus per-agent count and per-agent
+        pending dot. Same visibility rules as the list, so the numbers match what
+        a lazy per-agent fetch would return."""
+        assoc = instruction_data_source_association
+        base = await self._visible_main_build_conditions(db, organization, current_user)
+
+        # Main-build visible instruction ids per surface (as id sets, so pending
+        # ids can be unioned in below without double-counting ones already live).
+        global_ids = set((await db.execute(
+            select(Instruction.id).where(and_(*base, ~Instruction.data_sources.any()))
+        )).scalars().all())
+        skills_ids = set((await db.execute(
+            select(Instruction.id).where(and_(*base, Instruction.kind == 'skill'))
+        )).scalars().all())
+        agent_sets: dict = {}
+        for ds_id, iid in (await db.execute(
+            select(assoc.c.data_source_id, Instruction.id)
+            .select_from(Instruction)
+            .join(assoc, assoc.c.instruction_id == Instruction.id)
+            .where(and_(*base))
+        )).all():
+            agent_sets.setdefault(str(ds_id), set()).add(str(iid))
+
+        # Fold not-in-main pending instructions into the same surfaces so the
+        # badges match the rows the lazy list now returns (which include pending).
+        pending_ids = {str(i) for i in await self.get_pending_change_instruction_ids(db, organization, current_user)}
+        pending_by_agent: dict = {}
+        if pending_ids:
+            pid_list = list(pending_ids)
+            for iid, kind in (await db.execute(
+                select(Instruction.id, Instruction.kind).where(Instruction.id.in_(pid_list))
+            )).all():
+                if kind == 'skill':
+                    skills_ids.add(str(iid))
+            assigned = set()
+            for ds_id, iid in (await db.execute(
+                select(assoc.c.data_source_id, assoc.c.instruction_id)
+                .where(assoc.c.instruction_id.in_(pid_list))
+            )).all():
+                agent_sets.setdefault(str(ds_id), set()).add(str(iid))
+                pending_by_agent[str(ds_id)] = True
+                assigned.add(str(iid))
+            # Pending instructions attached to no agent are global.
+            for iid in pending_ids - assigned:
+                global_ids.add(iid)
+
+        # Apply the SAME per-user table-accessibility cut the list applies
+        # (_filter_list_items_by_table_accessibility), so a table-pinned
+        # instruction the user can't see in the lazy list is not counted in the
+        # tree badge. Without this, the Instructions node shows the badge count
+        # (e.g. 3) then drops to the list length (0) once the rows load → the
+        # reported 3→0 flicker / "No instructions yet".
+        if current_user is not None:
+            all_counted = global_ids | skills_ids
+            for v in agent_sets.values():
+                all_counted |= v
+            hidden = await self._table_inaccessible_instruction_ids(
+                db, list(all_counted), str(current_user.id)
+            )
+            if hidden:
+                global_ids -= hidden
+                skills_ids -= hidden
+                for ds_id in list(agent_sets.keys()):
+                    agent_sets[ds_id] -= hidden
+                    if not agent_sets[ds_id]:
+                        del agent_sets[ds_id]
+                        pending_by_agent.pop(ds_id, None)
+                pending_ids -= hidden
+
+        by_agent = {k: len(v) for k, v in agent_sets.items()}
+
+        return {
+            "global": len(global_ids),
+            "skills": len(skills_ids),
+            "pending_total": len(pending_ids),
+            "by_agent": by_agent,
+            "pending_by_agent": pending_by_agent,
+            # The full per-instruction pending set, already computed above. Returned
+            # so the client can drive the per-row "pending review" dots from this
+            # single call instead of a second org-wide /pending-changes sweep.
+            "pending_instruction_ids": sorted(pending_ids),
+        }
+
+    async def search_knowledge(self, db, organization, current_user, q: str, limit: int = 20) -> dict:
+        """Cross-entity search for the /agents 'Search everything' box. Returns a
+        grouped shape (distinct from the instruction list): matching agents
+        (data sources) AND matching instructions, each visibility-scoped."""
+        from app.services.data_source_service import DataSourceService
+
+        q = (q or "").strip()
+        if not q:
+            return {"agents": [], "instructions": []}
+
+        # Instructions: reuse the list path (server-side search + visibility).
+        inst_resp = await self.get_instructions(
+            db=db, organization=organization, current_user=current_user,
+            skip=0, limit=limit, search=q,
+            include_own=True, include_drafts=True, include_archived=True,
+        )
+        instructions = inst_resp.get("items", [])
+
+        # Agents: filter the caller's visible data sources by name (small list).
+        ql = q.lower()
+        agents_all = await DataSourceService().get_active_data_sources(
+            db, organization, current_user, include_unconnected=True
+        )
+        agents = [a for a in agents_all if ql in (getattr(a, "name", "") or "").lower()][:limit]
+
+        return {"agents": agents, "instructions": instructions}
 
     async def get_available_source_types(
         self,
@@ -1261,32 +1415,99 @@ class InstructionService:
         from app.models.build_content import BuildContent
 
         org_id = str(organization.id)
-        cand_stmt = (
-            select(BuildContent.instruction_id)
-            .join(InstructionBuild, InstructionBuild.id == BuildContent.build_id)
-            .where(and_(
-                InstructionBuild.organization_id == org_id,
-                InstructionBuild.is_main.is_(False),
-                InstructionBuild.deleted_at.is_(None),
-                InstructionBuild.status.in_(["draft", "pending_approval"]),
-                InstructionBuild.source.in_(["user", "ai", "git"]),
-            ))
-            .distinct()
-        )
-        if candidate_ids is not None:
-            if not candidate_ids:
-                return set()
-            cand_stmt = cand_stmt.where(BuildContent.instruction_id.in_([str(i) for i in candidate_ids]))
+        if candidate_ids is not None and not candidate_ids:
+            return set()
 
-        cand_rows = (await db.execute(cand_stmt)).all()
+        from app.models.instruction_version import InstructionVersion as _IV
+        from app.services.text_hunks import rebased_hunks_against_main
+
+        # Batched equivalent of looping review_hunks() per instruction. Same
+        # per-hunk rule (a suggestion build counts only if it yields a hunk that
+        # isn't rejected and actually changes current main), but resolved with a
+        # fixed handful of bulk queries + an in-memory diff pass instead of
+        # O(instructions × builds) serialized round-trips.
+
+        # (1) Every pending suggestion build, with its proposed text and build
+        #     metadata (rejected_hunks + base_build_id are already-loaded columns,
+        #     no lazy load). The WHERE already selects exactly the pending
+        #     suggestion rows, so the candidate instruction ids are DERIVED from
+        #     these rows — we deliberately do NOT additionally filter by a
+        #     separately-materialized id list in the org-wide case: feeding a
+        #     thousands-element IN(...) here made SQLite pick a pathological plan
+        #     (~40x slower). candidate_ids (the on-screen subset, small) is the
+        #     one case where narrowing helps, so it's applied then.
+        sug_where = [
+            InstructionBuild.is_main.is_(False),
+            InstructionBuild.organization_id == org_id,
+            InstructionBuild.deleted_at.is_(None),
+            InstructionBuild.status.in_(["draft", "pending_approval"]),
+            InstructionBuild.source.in_(["user", "ai", "git"]),
+        ]
+        if candidate_ids is not None:
+            sug_where.append(BuildContent.instruction_id.in_([str(i) for i in candidate_ids]))
+        sug_rows = (await db.execute(
+            select(BuildContent.instruction_id, InstructionBuild, _IV.text)
+            .join(InstructionBuild, InstructionBuild.id == BuildContent.build_id)
+            .join(_IV, _IV.id == BuildContent.instruction_version_id)
+            .where(and_(*sug_where))
+        )).all()
+        if not sug_rows:
+            return set()
+        cand_ids = list({str(iid) for iid, _b, _t in sug_rows})
+
+        # (2) Live main text per candidate (authoritative is_main build content),
+        #     with a fallback to the live instruction row for legacy instructions
+        #     that predate main-build content — mirrors _main_text_of().
+        main_text: dict = {}
+        for iid, t in (await db.execute(
+            select(BuildContent.instruction_id, _IV.text)
+            .join(InstructionBuild, InstructionBuild.id == BuildContent.build_id)
+            .join(_IV, _IV.id == BuildContent.instruction_version_id)
+            .where(and_(
+                InstructionBuild.is_main.is_(True),
+                InstructionBuild.organization_id == org_id,
+                InstructionBuild.deleted_at.is_(None),
+                BuildContent.instruction_id.in_(cand_ids),
+            ))
+        )).all():
+            main_text[str(iid)] = t or ""
+        missing_main = [i for i in cand_ids if i not in main_text]
+        if missing_main:
+            for iid, txt in (await db.execute(
+                select(Instruction.id, Instruction.text).where(Instruction.id.in_(missing_main))
+            )).all():
+                main_text[str(iid)] = txt or ""
+
+        # (3) Base text for each (base_build_id, instruction_id) pair the
+        #     suggestions forked from — what _build_base_text() resolves per build.
+        base_pairs = {(str(b.base_build_id), str(iid)) for iid, b, _ in sug_rows if b.base_build_id}
+        base_text: dict = {}
+        if base_pairs:
+            base_bids = {bid for bid, _ in base_pairs}
+            base_iids = {iid for _, iid in base_pairs}
+            for bid, iid, txt in (await db.execute(
+                select(BuildContent.build_id, BuildContent.instruction_id, _IV.text)
+                .join(_IV, _IV.id == BuildContent.instruction_version_id)
+                .where(and_(
+                    BuildContent.build_id.in_(base_bids),
+                    BuildContent.instruction_id.in_(base_iids),
+                ))
+            )).all():
+                base_text[(str(bid), str(iid))] = txt or ""
+
+        # (4) Pure-Python pass — no awaits in the loop.
         pending: set = set()
-        for (iid,) in cand_rows:
-            try:
-                r = await self.review_hunks(db, str(iid), organization=organization, current_user=current_user)
-                if r and r.get("suggestions"):
-                    pending.add(str(iid))
-            except Exception:
-                pass
+        for iid, build, proposed in sug_rows:
+            iid = str(iid)
+            if iid in pending:
+                continue
+            rejected = self._rejected_keys(build, iid)
+            bt = base_text.get((str(build.base_build_id), iid), "") if build.base_build_id else ""
+            if any(
+                h["key"] not in rejected
+                for h in rebased_hunks_against_main(bt, proposed or "", main_text.get(iid, ""))
+            ):
+                pending.add(iid)
         return pending
 
     async def accept_hunk(self, db: AsyncSession, instruction_id: str, *, build_id: str, hunk_key: str,
@@ -2309,6 +2530,62 @@ class InstructionService:
         """MVP: org-level manage_instructions is the admin gate."""
         return 'manage_instructions' in user_permissions or 'full_admin_access' in user_permissions
 
+    async def _can_auto_publish_build(
+        self, db: AsyncSession, build, current_user: User, user_permissions: set,
+    ) -> bool:
+        """Whether a build should auto-approve + promote to main on finalize.
+
+        Two tiers:
+        - Org admins (`full_admin_access` / org-level `manage_instructions`)
+          publish anything, including global instructions.
+        - Agent admins (per-agent `manage`, the agent-manager tier) auto-publish
+          only when EVERY instruction in the build is attached to data source(s)
+          they hold `manage_instructions` on (via the `manage` grant) and NONE is
+          global. Authoring an org-wide global instruction stays an org-level
+          capability, so a build that touches one falls back to admin review.
+        """
+        # Org admin → always (covers global + any agent).
+        if self._is_admin_permissions(user_permissions):
+            return True
+        if current_user is None:
+            return False
+
+        from app.models.build_content import BuildContent
+        from app.core.permission_resolver import resolve_permissions
+
+        instr_ids = [
+            str(iid) for (iid,) in (await db.execute(
+                select(BuildContent.instruction_id)
+                .where(BuildContent.build_id == str(build.id))
+                .distinct()
+            )).all()
+        ]
+        if not instr_ids:
+            return False
+
+        # Map each instruction in the build to its attached data source ids.
+        assoc = instruction_data_source_association
+        rows = (await db.execute(
+            select(assoc.c.instruction_id, assoc.c.data_source_id)
+            .where(assoc.c.instruction_id.in_(instr_ids))
+        )).all()
+        ds_by_instr: dict = {}
+        for iid, ds_id in rows:
+            ds_by_instr.setdefault(str(iid), set()).add(str(ds_id))
+
+        # Any global instruction (no data source) in the build → org-admin only.
+        if any(not ds_by_instr.get(iid) for iid in instr_ids):
+            return False
+
+        resolved = await resolve_permissions(
+            db, str(current_user.id), str(build.organization_id)
+        )
+        all_ds = {ds for dss in ds_by_instr.values() for ds in dss}
+        return all(
+            resolved.has_resource_permission("data_source", ds_id, "manage_instructions")
+            for ds_id in all_ds
+        )
+
     async def _get_instruction_by_id(self, db: AsyncSession, instruction_id: str, organization: Organization) -> Instruction:
         """Get instruction by ID with proper error handling"""
         
@@ -2387,6 +2664,9 @@ class InstructionService:
         build_id: Optional[str] = None,
         include_global: bool = True,
         current_user: Optional[User] = None,
+        kind: Optional[str] = None,
+        global_only: bool = False,
+        pending_only: bool = False,
     ) -> dict:
         """Execute the instructions query with given conditions. Returns paginated response.
 
@@ -2434,7 +2714,48 @@ class InstructionService:
                 select(BuildContent.instruction_id)
                 .where(BuildContent.build_id == target_build_id)
             )
-            base_conditions.append(Instruction.id.in_(build_instruction_ids_subquery))
+            membership_clause = Instruction.id.in_(build_instruction_ids_subquery)
+            # For the default main-build list (the /agents tree), also surface
+            # instructions awaiting approval that aren't in main yet — e.g. a new
+            # instruction a non-admin proposed, or a not-yet-approved edit. They
+            # come back flagged via current_build_status (set below) so the tree
+            # can render them highlighted as "Pending review". Skip when an
+            # explicit build_id is requested (that caller wants exactly that build).
+            if build_id is None and current_user is not None:
+                # The pending merge only needs to surface pending rows THIS list
+                # would actually show. When scoped to specific agents (or the
+                # global group), restrict the CPU-heavy per-hunk sweep to that
+                # subset instead of the whole org — output-identical (the
+                # data_source_ids / global_only filters below already exclude
+                # everything else) but bounded by the page, not the org. Without
+                # this, expanding one agent recomputes every pending change in the
+                # org (seconds at thousands of pending).
+                pending_candidates: Optional[List[str]] = None
+                if data_source_ids:
+                    pending_candidates = [
+                        str(r[0]) for r in (await db.execute(
+                            select(instruction_data_source_association.c.instruction_id)
+                            .where(instruction_data_source_association.c.data_source_id.in_(data_source_ids))
+                        )).all()
+                    ]
+                elif global_only:
+                    pending_candidates = [
+                        str(r[0]) for r in (await db.execute(
+                            select(Instruction.id).where(and_(
+                                Instruction.organization_id == organization.id,
+                                ~Instruction.data_sources.any(),
+                            ))
+                        )).all()
+                    ]
+                pending_ids = await self.get_pending_change_instruction_ids(
+                    db, organization, current_user, candidate_ids=pending_candidates
+                )
+                if pending_ids:
+                    membership_clause = or_(
+                        membership_clause,
+                        Instruction.id.in_([str(i) for i in pending_ids]),
+                    )
+            base_conditions.append(membership_clause)
 
         # Per-data-source visibility — applied to EVERYONE, admins included.
         # An instruction tied to a data source (agent) is only visible to users
@@ -2478,6 +2799,32 @@ class InstructionService:
         
         if status:
             filter_conditions.append(Instruction.status == status)
+        if kind:
+            filter_conditions.append(Instruction.kind == kind)
+        if global_only:
+            # Lazy "Global instructions" group: instructions attached to no agent.
+            filter_conditions.append(~Instruction.data_sources.any())
+        if pending_only:
+            # "Pending changes" view: only instructions with a LIVE pending change.
+            # The set is computed by the shared, access-scoped helper (same rule as
+            # /instructions/pending-changes and the per-instruction review), so this
+            # never widens visibility beyond the base_conditions above. Scope the
+            # (CPU-heavy) sweep to the requested agents/global subset when present.
+            pending_candidates: Optional[List[str]] = None
+            if data_source_ids:
+                pending_candidates = [
+                    str(r[0]) for r in (await db.execute(
+                        select(instruction_data_source_association.c.instruction_id)
+                        .where(instruction_data_source_association.c.data_source_id.in_(data_source_ids))
+                    )).all()
+                ]
+            pending_ids = await self.get_pending_change_instruction_ids(
+                db, organization, current_user, candidate_ids=pending_candidates
+            ) if current_user is not None else set()
+            filter_conditions.append(
+                Instruction.id.in_([str(i) for i in pending_ids]) if pending_ids
+                else literal(False)
+            )
         if categories:
             filter_conditions.append(Instruction.category.in_(categories))
         if data_source_ids:
@@ -2653,15 +3000,24 @@ class InstructionService:
                     )
                 )
                 main_ver: dict = {str(iid): vid for iid, vid in main_rows.all()}
-                # non-main draft/pending builds, newest first
+                # non-main draft/pending builds, newest first. Pull build
+                # provenance (source / creator / created_at) in the same pass so
+                # the "Pending changes" view can show who+when without a per-row
+                # round-trip.
+                from app.models.user import User as _User
                 build_rows = await db.execute(
                     select(
                         BuildContent.instruction_id,
                         InstructionBuild.id,
                         InstructionBuild.status,
                         BuildContent.instruction_version_id,
+                        InstructionBuild.source,
+                        InstructionBuild.created_at,
+                        _User.name,
+                        _User.email,
                     )
                     .join(InstructionBuild, BuildContent.build_id == InstructionBuild.id)
+                    .outerjoin(_User, _User.id == InstructionBuild.created_by_user_id)
                     .where(
                         BuildContent.instruction_id.in_(inst_ids),
                         InstructionBuild.organization_id == str(organization.id),
@@ -2673,13 +3029,19 @@ class InstructionService:
                     .order_by(InstructionBuild.created_at.desc())
                 )
                 latest_by_inst: dict = {}
-                for inst_id, b_id, b_status, ver_id in build_rows.all():
+                pending_meta_by_inst: dict = {}
+                for inst_id, b_id, b_status, ver_id, b_source, b_created_at, u_name, u_email in build_rows.all():
                     key = str(inst_id)
                     mv = main_ver.get(key)
                     if mv is not None and ver_id == mv:
                         continue  # inherited the main version — not a real pending change
                     if key not in latest_by_inst:  # rows are newest-first
                         latest_by_inst[key] = (str(b_id), b_status)
+                        pending_meta_by_inst[key] = {
+                            "source": b_source,
+                            "created_by": (u_name or u_email),
+                            "created_at": b_created_at,
+                        }
                 # Gate on the authoritative pending set (same rule as
                 # /instructions/pending-changes and the single-instruction
                 # detail). A build whose version differs from main but whose
@@ -2697,6 +3059,10 @@ class InstructionService:
                     hit = latest_by_inst.get(str(it.id))
                     if hit and str(it.id) in pending_ids:
                         it.current_build_id, it.current_build_status = hit
+                        meta = pending_meta_by_inst.get(str(it.id)) or {}
+                        it.pending_source = meta.get("source")
+                        it.pending_created_by = meta.get("created_by")
+                        it.pending_created_at = meta.get("created_at")
             except Exception as e:
                 logger.warning(f"Failed to batch-resolve current builds for instruction list: {e}")
 
@@ -2715,6 +3081,64 @@ class InstructionService:
             "pages": (total + limit - 1) // limit if limit > 0 else 1
         }
 
+    async def _table_inaccessible_instruction_ids(
+        self,
+        db: AsyncSession,
+        instruction_ids: List[str],
+        user_id: str,
+    ) -> set:
+        """Subset of ``instruction_ids`` that are HIDDEN from the user because
+        every datasource_table reference they carry is in the user's per-user
+        inaccessible-table overlay (``UserDataSourceTable.is_accessible == False``).
+
+        This is the single source of truth for the table-accessibility cut so the
+        list (``_filter_list_items_by_table_accessibility``) and the /agents tree
+        badges (``get_instruction_counts``) agree — otherwise a badge counts an
+        instruction the lazy list then drops, producing the 3→0 flicker.
+
+        Rules (an instruction is hidden iff ALL its table refs are inaccessible):
+        - No table references → not hidden (global / text-only instruction)
+        - At least one referenced table accessible → not hidden
+        - No inaccessible overlay rows for the user → nothing hidden
+        """
+        from app.models.user_data_source_overlay import UserDataSourceTable
+        from app.models.instruction_reference import InstructionReference
+
+        ids = [str(i) for i in instruction_ids]
+        if not ids:
+            return set()
+
+        # Get the set of table IDs this user cannot access
+        result = await db.execute(
+            select(UserDataSourceTable.data_source_table_id)
+            .where(
+                UserDataSourceTable.user_id == user_id,
+                UserDataSourceTable.is_accessible == False,
+                UserDataSourceTable.data_source_table_id.isnot(None),
+            )
+        )
+        inaccessible = {row[0] for row in result.all()}
+        if not inaccessible:
+            return set()
+
+        ref_result = await db.execute(
+            select(InstructionReference.instruction_id, InstructionReference.object_id)
+            .where(
+                InstructionReference.instruction_id.in_(ids),
+                InstructionReference.object_type == "datasource_table",
+            )
+        )
+        refs_by_instruction: dict[str, set[str]] = {}
+        for inst_id, table_id in ref_result.all():
+            refs_by_instruction.setdefault(str(inst_id), set()).add(table_id)
+
+        hidden: set = set()
+        for inst_id, table_refs in refs_by_instruction.items():
+            # All refs inaccessible (and there is at least one ref) → hidden.
+            if table_refs and not (table_refs - inaccessible):
+                hidden.add(inst_id)
+        return hidden
+
     async def _filter_list_items_by_table_accessibility(
         self,
         db: AsyncSession,
@@ -2729,47 +3153,14 @@ class InstructionService:
         - At least one referenced table accessible → keep
         - No overlay rows for user → keep all (no filtering)
         """
-        from app.models.user_data_source_overlay import UserDataSourceTable
-        from app.models.instruction_reference import InstructionReference
-
-        # Get the set of table IDs this user cannot access
-        result = await db.execute(
-            select(UserDataSourceTable.data_source_table_id)
-            .where(
-                UserDataSourceTable.user_id == user_id,
-                UserDataSourceTable.is_accessible == False,
-                UserDataSourceTable.data_source_table_id.isnot(None),
-            )
-        )
-        inaccessible = {row[0] for row in result.all()}
-        if not inaccessible:
+        if not items:
             return items
-
-        # Batch-load table references for all instruction IDs
-        item_ids = [str(item.id) for item in items]
-        if not item_ids:
-            return items
-
-        ref_result = await db.execute(
-            select(InstructionReference.instruction_id, InstructionReference.object_id)
-            .where(
-                InstructionReference.instruction_id.in_(item_ids),
-                InstructionReference.object_type == "datasource_table",
-            )
+        hidden = await self._table_inaccessible_instruction_ids(
+            db, [str(item.id) for item in items], user_id
         )
-        refs_by_instruction: dict[str, set[str]] = {}
-        for inst_id, table_id in ref_result.all():
-            refs_by_instruction.setdefault(inst_id, set()).add(table_id)
-
-        filtered = []
-        for item in items:
-            table_refs = refs_by_instruction.get(str(item.id))
-            if not table_refs:
-                filtered.append(item)
-            elif table_refs - inaccessible:
-                filtered.append(item)
-            # else: all refs inaccessible → exclude
-        return filtered
+        if not hidden:
+            return items
+        return [item for item in items if str(item.id) not in hidden]
 
     async def _get_user_permissions(self, db: AsyncSession, user: User, organization: Organization) -> set:
         """Get user's org-level permissions via the RBAC resolver."""
@@ -3312,11 +3703,15 @@ class InstructionService:
             # Submit the build for approval
             await self.build_service.submit_build(db, build.id)
 
-            # Check if user is admin
-            is_admin = self._is_admin_permissions(user_permissions)
+            # Auto-publish authority: org admins publish anything; agent admins
+            # (per-agent `manage`) auto-publish builds scoped entirely to their
+            # own agents. Otherwise the build stays pending for admin review.
+            can_publish = await self._can_auto_publish_build(
+                db, build, current_user, user_permissions
+            )
 
-            if is_admin:
-                # Admin: auto-approve and auto-promote to main
+            if can_publish:
+                # Auto-approve and auto-promote to main
                 await self.build_service.approve_build(
                     db, build.id, approved_by_user_id=current_user.id
                 )
@@ -3326,15 +3721,15 @@ class InstructionService:
                 else:
                     logger.info(f"Auto-approved build {build.id} (already main)")
             else:
-                # Non-admin: leave in pending_approval for admin review
-                logger.info(f"Build {build.id} submitted for admin approval (non-admin user)")
+                # No publish authority: leave in pending_approval for admin review
+                logger.info(f"Build {build.id} submitted for admin approval (no publish authority)")
 
             # Single commit for all deferred audit logs from submit/approve/promote
             await db.commit()
 
             # Surface non-admin / AI suggestions in the admin Review feed (one
             # item per changed instruction × attached agent). Never block.
-            if not is_admin and getattr(build, "source", "user") in ("user", "ai"):
+            if not can_publish and getattr(build, "source", "user") in ("user", "ai"):
                 try:
                     from app.services.review_producers import emit_instruction_suggestions_for_build
                     await emit_instruction_suggestions_for_build(

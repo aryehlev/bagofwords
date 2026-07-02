@@ -2,12 +2,13 @@
 Connection Routes - Admin-only CRUD for database connections.
 Connections are the underlying database connections that Domains (DataSources) link to.
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import List
 
+from app.ee.audit.service import audit_service
 from app.dependencies import get_async_db
 from app.models.user import User
 from app.core.auth import current_user
@@ -18,7 +19,7 @@ from app.models.connection_tool import ConnectionTool
 from app.models.data_source import DataSource
 from app.dependencies import get_current_organization
 from app.services.connection_service import ConnectionService
-from app.core.permissions_decorator import requires_permission
+from app.core.permissions_decorator import requires_permission, requires_resource_permission
 from app.core.permission_resolver import resolve_permissions, FULL_ADMIN
 from app.models.membership import Membership
 from app.schemas.connection_schema import (
@@ -273,7 +274,7 @@ async def create_connection(
 
 
 @router.get("/{connection_id}", response_model=ConnectionDetailSchema)
-@requires_permission('manage_connections')
+@requires_resource_permission('connection', 'manage_connection')
 async def get_connection(
     connection_id: str,
     current_user: User = Depends(current_user),
@@ -333,7 +334,7 @@ async def get_connection(
 
 
 @router.put("/{connection_id}", response_model=ConnectionSchema)
-@requires_permission('manage_connections')  # Admin-only
+@requires_resource_permission('connection', 'manage_connection')
 async def update_connection(
     connection_id: str,
     data: ConnectionUpdate,
@@ -367,7 +368,7 @@ async def update_connection(
 
 
 @router.delete("/{connection_id}")
-@requires_permission('manage_connections')  # Admin-only
+@requires_resource_permission('connection', 'manage_connection')
 async def delete_connection(
     connection_id: str,
     current_user: User = Depends(current_user),
@@ -401,7 +402,7 @@ async def test_connection_params(
 
 
 @router.post("/{connection_id}/test", response_model=ConnectionTestResult)
-@requires_permission('manage_connections')  # Admin-only
+@requires_resource_permission('connection', 'manage_connection')
 async def test_connection(
     connection_id: str,
     overrides: ConnectionTestOverride = None,
@@ -460,6 +461,7 @@ async def test_my_connection_credentials(
 @router.delete("/{connection_id}/my-credentials")
 async def delete_my_connection_credentials(
     connection_id: str,
+    request: Request,
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
@@ -467,12 +469,21 @@ async def delete_my_connection_credentials(
     """Disconnect: delete the current user's saved credentials for this connection."""
     connection = await connection_service.get_connection(db, connection_id, organization)
     await _ensure_can_read_connection(db, organization, user, connection)
-    return await connection_service.delete_user_credentials(
+    result = await connection_service.delete_user_credentials(
         db=db,
         connection_id=connection_id,
         organization=organization,
         current_user=user,
     )
+    try:
+        await audit_service.log(
+            db=db, organization_id=organization.id, action="connection.my_credentials_deleted",
+            user_id=user.id, resource_type="connection", resource_id=str(connection_id),
+            request=request,
+        )
+    except Exception:
+        pass
+    return result
 
 
 class QueryIdentityUpdate(BaseModel):
@@ -483,6 +494,7 @@ class QueryIdentityUpdate(BaseModel):
 async def set_connection_query_identity(
     connection_id: str,
     data: QueryIdentityUpdate,
+    request: Request,
     current_user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
@@ -535,6 +547,15 @@ async def set_connection_query_identity(
         db.add(row)
         await db.commit()
 
+    try:
+        await audit_service.log(
+            db=db, organization_id=organization.id, action="connection.query_identity_changed",
+            user_id=current_user.id, resource_type="connection", resource_id=str(connection_id),
+            details={"query_identity": identity}, request=request,
+        )
+    except Exception:
+        pass
+
     status = await UserDataSourceCredentialsService().build_user_status_for_connection(
         db, connection, current_user, live_test=False
     )
@@ -544,7 +565,7 @@ async def set_connection_query_identity(
 
 
 @router.post("/{connection_id}/refresh")
-@requires_permission('manage_connections')  # Admin-only
+@requires_resource_permission('connection', 'manage_connection')
 async def refresh_connection_schema(
     connection_id: str,
     current_user: User = Depends(current_user),
@@ -567,7 +588,7 @@ async def refresh_connection_schema(
 
 
 @router.post("/{connection_id}/reindex")
-@requires_permission('manage_connections')
+@requires_resource_permission('connection', 'manage_connection')
 async def reindex_connection(
     connection_id: str,
     force: bool = False,
@@ -765,6 +786,7 @@ async def get_connection_tools_list(
 async def batch_update_connection_tools(
     connection_id: str,
     data: BatchToolUpdate,
+    request: Request,
     current_user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
@@ -772,6 +794,15 @@ async def batch_update_connection_tools(
     """Batch enable/disable tools."""
     await connection_service.get_connection(db, connection_id, organization)
     tools = await connection_service.batch_update_tools(db, data.tool_ids, data.is_enabled)
+    try:
+        await audit_service.log(
+            db=db, organization_id=organization.id, action="connection.tools_batch_updated",
+            user_id=current_user.id, resource_type="connection", resource_id=str(connection_id),
+            details={"tool_ids": list(data.tool_ids or []), "is_enabled": data.is_enabled},
+            request=request,
+        )
+    except Exception:
+        pass
     return [
         ConnectionToolSchema(
             id=str(t.id),
@@ -793,6 +824,7 @@ async def update_tool(
     connection_id: str,
     tool_id: str,
     data: ConnectionToolUpdate,
+    request: Request,
     current_user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
@@ -802,6 +834,15 @@ async def update_tool(
     tool = await connection_service.update_connection_tool(
         db, tool_id, is_enabled=data.is_enabled, policy=data.policy
     )
+    try:
+        await audit_service.log(
+            db=db, organization_id=organization.id, action="connection.tool_updated",
+            user_id=current_user.id, resource_type="connection", resource_id=str(connection_id),
+            details={"tool_id": str(tool_id), "is_enabled": data.is_enabled, "policy": data.policy},
+            request=request,
+        )
+    except Exception:
+        pass
     return ConnectionToolSchema(
         id=str(tool.id),
         name=tool.name,

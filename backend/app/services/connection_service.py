@@ -30,6 +30,47 @@ from app.ee.audit.service import audit_service
 logger = logging.getLogger(__name__)
 
 
+def _user_auth_needs_enterprise(conn_type: str) -> bool:
+    """Per-user auth (`user_required` / OAuth / OBO) is Enterprise-gated only for
+    TABULAR / warehouse connections (per-user identity / OBO into a database).
+    Integrations — tools / files / objects (MCP, OneDrive, GDrive, popular apps)
+    — get per-user sign-in for free. Unknown types default to gated (safe)."""
+    try:
+        return get_entry(conn_type).data_shape == "tables"
+    except Exception:
+        return True
+
+
+async def grant_connection_owner(
+    db: AsyncSession, organization_id: str, connection_id: str, user_id: str,
+) -> None:
+    """Give a user full per-connection control (manage config + manage all
+    agents on it). Idempotent — skips if a grant already exists. Used when a
+    user creates a connection so non-admins can manage and build on it."""
+    from app.models.resource_grant import ResourceGrant
+
+    existing = await db.execute(
+        select(ResourceGrant).where(
+            ResourceGrant.resource_type == "connection",
+            ResourceGrant.resource_id == str(connection_id),
+            ResourceGrant.principal_type == "user",
+            ResourceGrant.principal_id == str(user_id),
+            ResourceGrant.deleted_at.is_(None),
+        )
+    )
+    if existing.scalar_one_or_none():
+        return
+    db.add(ResourceGrant(
+        organization_id=str(organization_id),
+        resource_type="connection",
+        resource_id=str(connection_id),
+        principal_type="user",
+        principal_id=str(user_id),
+        permissions=["manage_connection", "manage_data_sources"],
+    ))
+    await db.commit()
+
+
 # Human-readable noun for each data_shape; used in connection-test messages.
 _SHAPE_NOUNS = {
     "tables": ("table", "tables"),
@@ -101,11 +142,12 @@ class ConnectionService:
                 detail=f"The {type} connector requires an enterprise license."
             )
 
-        # Check enterprise license for user_required auth policy
-        if auth_policy == "user_required" and not is_enterprise_licensed():
+        # Per-user auth is free for integrations (tools/files/objects); Enterprise
+        # only for tabular/warehouse OBO. See _user_auth_needs_enterprise.
+        if auth_policy == "user_required" and _user_auth_needs_enterprise(type) and not is_enterprise_licensed():
             raise HTTPException(
                 status_code=402,
-                detail="User authentication mode requires an enterprise license."
+                detail="Per-user authentication for this connector requires an enterprise license."
             )
 
         # Default allowed_user_auth_modes for user_required connections on OBO-capable types.
@@ -166,6 +208,11 @@ class ConnectionService:
                 status_code=409,
                 detail=f"A connection named '{name}' already exists in this organization."
             )
+
+        # Grant the creator full per-connection control (manage config + manage
+        # all agents on it, which implies create) so a non-admin who creates a
+        # connection can use and manage it — mirrors agent ownership.
+        await grant_connection_owner(db, str(organization.id), str(connection.id), str(current_user.id))
 
         # Schema discovery is pushed to a background indexing job so POST
         # returns in ~ms even for slow sources (QVD/PBIRS/large warehouses).
@@ -272,10 +319,10 @@ class ConnectionService:
         new_auth_policy = updates.get("auth_policy")
         if new_auth_policy == "user_required" and connection.auth_policy != "user_required":
             from app.ee.license import is_enterprise_licensed
-            if not is_enterprise_licensed():
+            if _user_auth_needs_enterprise(connection.type) and not is_enterprise_licensed():
                 raise HTTPException(
                     status_code=402,
-                    detail="User authentication mode requires an enterprise license."
+                    detail="Per-user authentication for this connector requires an enterprise license."
                 )
 
         # Scheduled auto-reindex is an enterprise feature. Gate any attempt to
@@ -417,36 +464,83 @@ class ConnectionService:
 
         Data sources that only have this connection will also be deleted.
         """
-        connection = await self.get_connection(db, connection_id, organization)
+        # Capture the org id as a plain string up front. The retry path below
+        # rolls back on a concurrent-write FK violation, and a rollback expires
+        # every ORM instance — so touching `organization.id` afterwards would
+        # fire implicit (sync) lazy IO and raise MissingGreenlet under asyncpg.
+        organization_id = str(organization.id)
+        current_user_id = str(current_user.id)
 
-        # Capture details before deletion for audit
-        connection_name = connection.name
+        # Drain any in-flight schema indexing for this connection before we
+        # delete. The indexer runs on a background loop with its own session
+        # and inserts `connection_tables` rows asynchronously (see
+        # ConnectionIndexingService). If it commits a row after our ORM has
+        # snapshotted the (delete-orphan) collection, the parent DELETE leaves
+        # an orphan child and Postgres rejects it with a foreign-key violation
+        # ("connection_tables_connection_id_fkey"). SQLite doesn't enforce the
+        # FK so it silently passed there — this was the flaky e2e failure.
+        # Waiting for the writer to reach a terminal state means the eager load
+        # below sees every committed child, so the cascade deletes them all.
+        from app.services.connection_indexing_service import ConnectionIndexingService
+        indexing_service = ConnectionIndexingService()
 
-        # Log impact for audit
-        agent_count = len(connection.data_sources) if connection.data_sources else 0
-        deleted_agent_names = []
+        async def _drain() -> None:
+            try:
+                await indexing_service.wait_for_active(db, connection_id, timeout_s=120.0)
+            except TimeoutError:
+                logger.warning(
+                    "delete_connection: indexing still active after wait; proceeding",
+                    extra={"connection_id": str(connection_id)},
+                )
 
-        if agent_count > 0:
-            agent_names = [ds.name for ds in connection.data_sources]
-            logger.info(f"Deleting connection {connection.name} ({connection_id}) which is linked to {agent_count} agent(s): {agent_names}")
+        async def _load_and_delete(org: Organization) -> tuple[str, int, list]:
+            connection = await self.get_connection(db, connection_id, org)
+            connection_name = connection.name
 
-            # Delete data sources that only have this connection
-            for ds in connection.data_sources:
-                if len(ds.connections) == 1:
-                    deleted_agent_names.append(ds.name)
-                    logger.info(f"Deleting data source {ds.name} ({ds.id}) as it only has this connection")
-                    await db.delete(ds)
+            agent_count = len(connection.data_sources) if connection.data_sources else 0
+            deleted_agent_names: list = []
+            if agent_count > 0:
+                agent_names = [ds.name for ds in connection.data_sources]
+                logger.info(f"Deleting connection {connection.name} ({connection_id}) which is linked to {agent_count} agent(s): {agent_names}")
 
-        await db.delete(connection)
-        await db.commit()
+                # Delete data sources that only have this connection
+                for ds in connection.data_sources:
+                    if len(ds.connections) == 1:
+                        deleted_agent_names.append(ds.name)
+                        logger.info(f"Deleting data source {ds.name} ({ds.id}) as it only has this connection")
+                        await db.delete(ds)
+
+            await db.delete(connection)
+            await db.commit()
+            return connection_name, agent_count, deleted_agent_names
+
+        await _drain()
+        try:
+            connection_name, agent_count, deleted_agent_names = await _load_and_delete(organization)
+        except IntegrityError:
+            # Safety net for the (now narrow) window where a concurrent writer
+            # committed a child row after our eager load. Roll back, drain the
+            # indexer again, then re-fetch so the eager load picks up the
+            # straggler children and the ORM cascade deletes the full chain.
+            # The rollback expired `organization`, so re-load it (by id) before
+            # reusing it — see the MissingGreenlet note above.
+            await db.rollback()
+            logger.warning(
+                "delete_connection: FK violation on delete; draining indexer "
+                "and retrying",
+                extra={"connection_id": str(connection_id)},
+            )
+            organization = await db.get(Organization, organization_id)
+            await _drain()
+            connection_name, agent_count, deleted_agent_names = await _load_and_delete(organization)
 
         # Audit log
         try:
             await audit_service.log(
                 db=db,
-                organization_id=str(organization.id),
+                organization_id=organization_id,
                 action="connection.deleted",
-                user_id=str(current_user.id),
+                user_id=current_user_id,
                 resource_type="connection",
                 resource_id=str(connection_id),
                 details={"name": connection_name, "impacted_agents": agent_count, "deleted_agents": deleted_agent_names},

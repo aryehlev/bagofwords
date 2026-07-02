@@ -495,6 +495,25 @@ class DruidConfig(BaseModel):
     )
 
 
+class DruidTokenCredentials(BaseModel):
+    token: str = Field(
+        ...,
+        title="API Token",
+        description="Bearer token sent as 'Authorization: Bearer <token>'.",
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
+class DruidBasicTokenCredentials(BaseModel):
+    basic_token: str = Field(
+        ...,
+        title="API Token",
+        description="Token sent verbatim as 'Authorization: Basic <token>' — not "
+        "base64-encoded. Use this for Imply Polaris 'pok_…' API keys.",
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
 # MongoDB
 class MongoDBCredentials(BaseModel):
     user: Optional[str] = Field(
@@ -1359,6 +1378,7 @@ class CustomAPIConfig(BaseModel):
         default={},
         title="Custom Headers",
         description="Additional headers to send with every request (e.g., ontology, results-limit)",
+        json_schema_extra={"ui:type": "keyvalue"}
     )
     endpoints: list = Field(
         default=[],

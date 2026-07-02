@@ -27,6 +27,7 @@ from app.models.report_data_source_association import report_data_source_associa
 from app.models.data_source_file_association import data_source_file_association
 from app.models.sheet_schema import SheetSchema
 from app.models.prompt import Prompt
+from app.models.prompt_run import PromptRun
 from app.models.plan import Plan
 from app.models.mention import Mention
 from app.models.file_tag import FileTag
@@ -77,6 +78,7 @@ from app.models.instruction_label import InstructionLabel
 from app.models.instruction_label import instruction_label_association
 from app.models.llm_usage_record import LLMUsageRecord
 from app.models.api_key import ApiKey
+from app.models.service_account import ServiceAccount
 from app.models.scheduled_prompt import ScheduledPrompt
 from app.models.instruction_build import InstructionBuild
 from app.models.oauth_server import OAuthClient, OAuthAuthorizationCode, OAuthAccessToken
@@ -90,6 +92,7 @@ from app.models.report_share import ReportShare
 from app.models.report_star import ReportStar
 from app.models.agent_automation_run import AgentAutomationRun
 from app.models.review_item import ReviewItem
+from app.models.notification import Notification
 from app.models.usage_policy import (
     UsagePolicy,
     UsagePolicyAssignment,
