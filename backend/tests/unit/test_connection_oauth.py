@@ -326,7 +326,9 @@ class TestOBOExchange:
         )
         tokens = await exchange_obo_token("login_token", conn)
         assert tokens["access_token"] == "obo_fabric"
-        assert "api.fabric.microsoft.com" in captured["body"]["scope"]
+        # Fabric SQL endpoints need Azure SQL tokens (aud=database.windows.net),
+        # not Fabric API tokens — see _OBO_SCOPES.
+        assert "database.windows.net/user_impersonation" in captured["body"]["scope"]
 
     @pytest.mark.asyncio
     async def test_obo_exchange_uses_oauth_client_fallback(self, monkeypatch):
