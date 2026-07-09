@@ -47,36 +47,3 @@ def set_usage_attribution(attribution: Optional[UsageAttribution]):
 def reset_usage_attribution(token) -> None:
     with contextlib.suppress(Exception):
         _current_attribution.reset(token)
-
-
-@contextlib.contextmanager
-def usage_attribution(
-    *,
-    organization_id: Optional[str] = None,
-    user_id: Optional[str] = None,
-    report_id: Optional[str] = None,
-    data_source_id: Optional[str] = None,
-):
-    """Scope a block of work to a given attribution.
-
-    Empty / None fields are dropped so they don't clobber an outer scope.
-    """
-    attribution: UsageAttribution = {}
-    if organization_id:
-        attribution["organization_id"] = str(organization_id)
-    if user_id:
-        attribution["user_id"] = str(user_id)
-    if report_id:
-        attribution["report_id"] = str(report_id)
-    if data_source_id:
-        attribution["data_source_id"] = str(data_source_id)
-
-    # Merge over any outer attribution so a narrower inner scope (e.g. a
-    # data-source-specific tool) can add data_source_id without losing the
-    # run-level user/report.
-    merged = {**get_usage_attribution(), **attribution}
-    token = set_usage_attribution(merged or None)
-    try:
-        yield
-    finally:
-        reset_usage_attribution(token)

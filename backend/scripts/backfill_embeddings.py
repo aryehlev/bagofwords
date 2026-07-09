@@ -3,7 +3,8 @@
 Embeds existing published instructions and recent steps so semantic retrieval
 has an index to query. Idempotent: rows whose ``content_hash`` is unchanged are
 skipped, so it's safe to re-run (e.g. after a model switch, which changes
-``model_id`` and forces a re-embed).
+``model_id`` and forces a re-embed; rows left under the old model are purged
+per org after re-embedding).
 
 Usage:
 
@@ -33,30 +34,17 @@ from app.models.step import Step
 from app.models.widget import Widget
 from app.models.report import Report
 from app.ai.context.semantic_search import SemanticSearch
-
-
-def _data_model_text(data_model) -> str:
-    parts: List[str] = []
-    if isinstance(data_model, dict):
-        for key in ("title", "name", "description"):
-            val = data_model.get(key)
-            if isinstance(val, str) and val.strip():
-                parts.append(val.strip())
-        for c in data_model.get("columns", []) or []:
-            if isinstance(c, dict):
-                name = c.get("generated_column_name") or c.get("name")
-                if name:
-                    parts.append(str(name))
-    return " ".join(parts)
+from app.services.embedding_service import step_embedding_text
 
 
 def _step_text(step: Step) -> str:
-    parts = [_data_model_text(step.data_model or {})]
-    if getattr(step, "prompt", None):
-        parts.append(str(step.prompt))
-    if getattr(step, "title", None):
-        parts.append(str(step.title))
-    return " ".join(p for p in parts if p).strip()
+    # Delegate to the shared composer so backfilled vectors match the ones the
+    # live step-completion hook produces (agent_v2 -> schedule_index_step).
+    return step_embedding_text(
+        step.data_model or {},
+        prompt=getattr(step, "prompt", None),
+        title=getattr(step, "title", None),
+    )
 
 
 async def _chunked_index(ss: SemanticSearch, owner_type: str,
@@ -125,6 +113,13 @@ async def backfill_org(session, org: Organization, days: int, batch_size: int) -
         if len(step_rows) < page_size:
             break
         offset += page_size
+
+    # After a model switch the re-embeds above land under the new model_id but
+    # the old model's rows stay behind (the upsert key includes model_id) —
+    # purge them explicitly so re-running the backfill fully retires the old
+    # model. Best-effort inside purge_stale_model_rows.
+    await ss.purge_stale_model_rows("instruction")
+    await ss.purge_stale_model_rows("step")
 
     print(f"[org={org.id}] embedded {n_inst} instructions, {n_step} steps")
 

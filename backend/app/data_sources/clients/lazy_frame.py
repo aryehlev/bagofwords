@@ -64,6 +64,35 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# Spill files older than this are considered orphans (see _sweep_stale_files).
+_STALE_AFTER_SECONDS = 24 * 3600
+_swept_roots: set = set()
+
+
+def _sweep_stale_files(root: Path) -> None:
+    """Best-effort orphan cleanup for the lazy spill dir, once per root per
+    process. LazyFrame.close() deletes its own file, but a crashed/killed run
+    never gets there and would leak Parquet files forever. Anything older than
+    24h is long past any live query's lifetime, so delete it. Only files
+    matching our own naming pattern are touched, and errors are swallowed —
+    this must never break a query."""
+    if root in _swept_roots:
+        return
+    _swept_roots.add(root)
+    import time
+
+    cutoff = time.time() - _STALE_AFTER_SECONDS
+    try:
+        for f in root.glob("lazy_*.parquet"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink(missing_ok=True)
+            except OSError:
+                continue
+    except Exception:
+        logger.debug("lazy_frame: stale-file sweep of %s failed", root, exc_info=True)
+
+
 class StreamConfig:
     """Caps for streaming ingest. Generous defaults; tune via env."""
 
@@ -73,6 +102,7 @@ class StreamConfig:
         self.max_bytes = _env_int("BOW_LAZY_MAX_BYTES", 8 * 1024 * 1024 * 1024)
         root = os.environ.get("BOW_LAZY_DIR")
         self.root = Path(root) if root else Path(tempfile.gettempdir()) / "bow_lazy"
+        _sweep_stale_files(self.root)
 
     def limit_desc(self) -> str:
         return f"max_rows={self.max_rows}, max_bytes={self.max_bytes}"
@@ -164,6 +194,75 @@ class LazyFrame:
         self.close()
 
 
+def _close_quietly(it) -> None:
+    """Explicitly close a generator so any `with connect_cm()` block inside it
+    releases its connection *now*, not whenever refcount GC gets around to the
+    suspended frame after an exception unwinds."""
+    close = getattr(it, "close", None)
+    if close is not None:
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _widen_null_columns(table):
+    """Prepare the FIRST chunk's schema for the ParquetWriter: a column that is
+    all-NULL within that chunk infers pa.null(), which would lock the file
+    schema to null and make every later non-null chunk unwritable. Widen null
+    columns to nullable float64 — the common cause is a nullable numeric column
+    — so later int/float chunks cast cleanly. (A later *string* chunk still
+    fails the cast, with an error naming the column; that beats silently
+    stringifying numbers.)"""
+    import pyarrow as pa
+
+    fields = [
+        f.with_type(pa.float64()) if pa.types.is_null(f.type) else f
+        for f in table.schema
+    ]
+    schema = pa.schema(fields, metadata=table.schema.metadata)
+    return table if schema.equals(table.schema) else table.cast(schema)
+
+
+def _cast_chunk_to_schema(table, schema):
+    """Reconcile a later chunk's inferred schema with the writer's. Chunks are
+    typed independently, so a nullable numeric column that happens to be
+    all-NULL (or all-int) in one 50k-row chunk infers a different Arrow dtype
+    and pq.ParquetWriter.write_table would abort the whole stream. Try a safe
+    cast first, fall back to a lossy one, and if even that fails raise a clear
+    error naming the offending column instead of pyarrow's opaque failure."""
+    if table.schema.equals(schema, check_metadata=False):
+        return table
+    try:
+        return table.cast(schema)
+    except Exception:
+        pass  # e.g. float chunk into an int column; retry lossy below
+    try:
+        return table.cast(schema, safe=False)
+    except Exception as exc:
+        if table.schema.names != schema.names:
+            detail = (
+                f"chunk columns {table.schema.names} do not match "
+                f"file columns {schema.names}"
+            )
+        else:
+            detail = "schemas differ"
+            for field in schema:
+                col = table.column(field.name)
+                try:
+                    col.cast(field.type, safe=False)
+                except Exception:
+                    detail = (
+                        f"column '{field.name}' is {col.type} in this chunk "
+                        f"but {field.type} in the file"
+                    )
+                    break
+        raise ValueError(
+            f"Streamed result chunks have irreconcilable schemas: {detail}. "
+            "Cast the column to one type in the query (e.g. CAST(col AS DOUBLE))."
+        ) from exc
+
+
 def stream_sqlalchemy_to_parquet(
     connect_cm: Callable[[], ContextManager],
     sql: str,
@@ -177,51 +276,36 @@ def stream_sqlalchemy_to_parquet(
     ResultTooLargeError once the row/byte budget is exceeded, deleting the
     partial file.
     """
-    import pyarrow as pa
-    import pyarrow.parquet as pq
     from sqlalchemy import text
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    writer: Optional["pq.ParquetWriter"] = None
-    rows = 0
-    byte_estimate = 0
-    try:
+    def chunks():
         with connect_cm() as conn:
             try:
                 conn = conn.execution_options(stream_results=True)  # server-side cursor
             except Exception:
                 pass  # driver doesn't support it; chunking still bounds peak
-            for chunk in pd.read_sql(text(sql), conn, chunksize=config.chunksize):
-                rows += len(chunk)
-                byte_estimate += int(chunk.memory_usage(deep=True).sum())
-                if rows > config.max_rows or byte_estimate > config.max_bytes:
-                    raise ResultTooLargeError(
-                        rows=rows, byte_estimate=byte_estimate, limit_desc=config.limit_desc()
-                    )
-                table = pa.Table.from_pandas(chunk, preserve_index=False)
-                if writer is None:
-                    writer = pq.ParquetWriter(str(path), table.schema)
-                writer.write_table(table)
-        if writer is None:
-            # Empty result with no chunk yielded: write an empty frame so the
-            # LazyFrame still has a readable (0-row) Parquet to open.
-            pd.DataFrame().to_parquet(path, index=False)
-    except BaseException:
-        if writer is not None:
-            try:
-                writer.close()
-            except Exception:
-                pass
-            writer = None
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise
+            result = conn.execute(text(sql))
+            # The column list is known before any rows arrive, so a 0-row
+            # result can still yield a schema-bearing empty frame (same
+            # pattern as stream_dbapi_cursor_to_parquet). pd.read_sql's chunk
+            # iterator can yield nothing for empty results, which would write
+            # a zero-COLUMN Parquet and break later `.sql("SELECT col ...")`.
+            columns = list(result.keys())
+            produced = False
+            while True:
+                batch = result.fetchmany(config.chunksize)
+                if not batch:
+                    break
+                produced = True
+                yield pd.DataFrame.from_records(batch, columns=columns or None)
+            if not produced and columns:
+                yield pd.DataFrame(columns=columns)  # keep schema for empty result
+
+    gen = chunks()
+    try:
+        return _consume_chunks_to_parquet(gen, path, config)
     finally:
-        if writer is not None:
-            writer.close()
-    return path
+        gen.close()
 
 
 def lazy_from_dataframe(df: pd.DataFrame, config: Optional[StreamConfig] = None) -> LazyFrame:
@@ -255,15 +339,17 @@ def lazy_query_via_sqlalchemy(
     return LazyFrame.from_parquet(path, owns_source=True)
 
 
-def _consume_chunks_to_parquet(chunks, path: Path, config: StreamConfig) -> Path:
+def _consume_chunks_to_parquet(chunks, path: Path, config: StreamConfig, columns=None) -> Path:
     """Write an iterable of DataFrame chunks to one Parquet file, enforcing the
     row/byte cap and aborting (with cleanup) if exceeded. Shared by the DBAPI
-    streamers below."""
+    streamers below. `columns`, when known up front, keeps the real schema in
+    the Parquet even if the iterable yields no chunks at all."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     path.parent.mkdir(parents=True, exist_ok=True)
     writer: Optional["pq.ParquetWriter"] = None
+    schema = None
     rows = 0
     byte_estimate = 0
     try:
@@ -276,10 +362,19 @@ def _consume_chunks_to_parquet(chunks, path: Path, config: StreamConfig) -> Path
                 )
             table = pa.Table.from_pandas(chunk, preserve_index=False)
             if writer is None:
-                writer = pq.ParquetWriter(str(path), table.schema)
+                table = _widen_null_columns(table)
+                schema = table.schema
+                writer = pq.ParquetWriter(str(path), schema)
+            else:
+                table = _cast_chunk_to_schema(table, schema)
             writer.write_table(table)
         if writer is None:
-            pd.DataFrame().to_parquet(path, index=False)
+            # Empty result with no chunk yielded: write a 0-row Parquet that
+            # still carries the real column names (when known) so downstream
+            # `.sql("SELECT col ...")` keeps working.
+            empty = pd.DataFrame(columns=list(columns)) if columns else pd.DataFrame()
+            table = _widen_null_columns(pa.Table.from_pandas(empty, preserve_index=False))
+            pq.write_table(table, str(path))
     except BaseException:
         if writer is not None:
             try:
@@ -295,6 +390,7 @@ def _consume_chunks_to_parquet(chunks, path: Path, config: StreamConfig) -> Path
     finally:
         if writer is not None:
             writer.close()
+        _close_quietly(chunks)  # release the source connection promptly
     return path
 
 
@@ -304,7 +400,25 @@ def stream_dbapi_readsql_to_parquet(connect_cm, sql, path, config):
     pandas reads directly: sqlite3, teradatasql, pyodbc."""
     def chunks():
         with connect_cm() as conn:
-            yield from pd.read_sql(sql, conn, chunksize=config.chunksize)
+            produced = False
+            for chunk in pd.read_sql(sql, conn, chunksize=config.chunksize):
+                produced = True
+                yield chunk
+            if not produced:
+                # Older pandas yields no chunks at all for a 0-row result;
+                # recover the column list from a cursor so the Parquet keeps
+                # the real schema (cheap: the result is empty).
+                cursor = conn.cursor()
+                try:
+                    cursor.execute(sql)
+                    columns = [d[0] for d in cursor.description] if cursor.description else []
+                finally:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
+                if columns:
+                    yield pd.DataFrame(columns=columns)
     return _consume_chunks_to_parquet(chunks(), path, config)
 
 
@@ -406,6 +520,7 @@ def _consume_arrow_to_parquet(arrow_iter, path: Path, config: StreamConfig) -> P
 
     path.parent.mkdir(parents=True, exist_ok=True)
     writer: Optional["pq.ParquetWriter"] = None
+    schema = None
     rows = 0
     byte_estimate = 0
     try:
@@ -420,7 +535,11 @@ def _consume_arrow_to_parquet(arrow_iter, path: Path, config: StreamConfig) -> P
                     rows=rows, byte_estimate=byte_estimate, limit_desc=config.limit_desc()
                 )
             if writer is None:
-                writer = pq.ParquetWriter(str(path), table.schema)
+                table = _widen_null_columns(table)
+                schema = table.schema
+                writer = pq.ParquetWriter(str(path), schema)
+            else:
+                table = _cast_chunk_to_schema(table, schema)
             writer.write_table(table)
         if writer is None:
             pd.DataFrame().to_parquet(path, index=False)
@@ -439,15 +558,17 @@ def _consume_arrow_to_parquet(arrow_iter, path: Path, config: StreamConfig) -> P
     finally:
         if writer is not None:
             writer.close()
+        _close_quietly(arrow_iter)  # release the source stream promptly
     return path
 
 
-def consume_chunks_to_lazyframe(chunks, config: Optional[StreamConfig] = None) -> LazyFrame:
+def consume_chunks_to_lazyframe(chunks, config: Optional[StreamConfig] = None, columns=None) -> LazyFrame:
     """Spill an iterable of DataFrame chunks to a LazyFrame (e.g. Athena wrangler
-    chunksize iterator)."""
+    chunksize iterator). `columns`, when known, preserves the schema even for a
+    fully-empty iterable."""
     config = config or StreamConfig()
     path = config.root / f"lazy_{uuid.uuid4().hex}.parquet"
-    _consume_chunks_to_parquet(chunks, path, config)
+    _consume_chunks_to_parquet(chunks, path, config, columns=columns)
     return LazyFrame.from_parquet(path, owns_source=True)
 
 
@@ -476,4 +597,4 @@ def consume_row_dicts_to_lazyframe(
         if buf:
             yield pd.DataFrame(buf, columns=columns)
 
-    return consume_chunks_to_lazyframe(chunks(), config)
+    return consume_chunks_to_lazyframe(chunks(), config, columns=columns)

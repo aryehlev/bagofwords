@@ -146,6 +146,22 @@ class PromptBuilderV3:
         # the connected data should answer — that's the main failure mode for a
         # data tool, and each search incurs cost + sends the query outside the
         # provider's data boundary.
+        # Data-privacy mode is an org-level toggle — stable across turns and
+        # iterations, like web_fetch/web_search above — so it belongs in the
+        # cached system prefix rather than being re-billed in every user turn.
+        data_visibility_text = ""
+        if not getattr(planner_input, "allow_llm_see_data", True):
+            data_visibility_text = (
+                "<data_visibility>Data privacy mode is ON for this organization "
+                "(allow_llm_see_data is off). Data tools (create_data, read_query) "
+                "return only columns, row_count and aggregate stats (counts, "
+                "mean/std/sum, date ranges) — never raw rows; inspect_data is "
+                "disabled. This is expected, not an error: do not retry to \"see\" "
+                "the data or attempt to retrieve individual values. Reason from the "
+                "structure and aggregates provided, and answer without quoting raw "
+                "rows.</data_visibility>"
+            )
+
         web_search_directives_text = ""
         if getattr(planner_input, "web_search_enabled", False):
             web_search_directives_text = (
@@ -212,6 +228,7 @@ PLAN TYPE GUIDANCE
 - When working with data files (excel, csv, etc), ALWAYS use inspect_data to verify the file content and structure before creating data widgets.
 {web_fetch_directives_text}
 {web_search_directives_text}
+{data_visibility_text}
 
 {platform_directives_text}clarify protocol (read this every time)
 
@@ -331,6 +348,18 @@ Examples of good behavior:
         schemas_combined = getattr(planner_input, "schemas_combined", None)
         if schemas_combined:
             system = f"{system}\n\n{schemas_combined}"
+
+        # Organization instructions live in the SYSTEM prompt for the same
+        # reason as schemas_combined above. AgentV2 builds them once per run
+        # (prime_static, keyed on the turn's prompt) and reuses the rendered
+        # string across every planner iteration, and the instruction builder
+        # renders in a deterministic order — so the block is byte-identical
+        # across iterations and rides the provider prompt cache instead of
+        # being re-sent at the full input rate in every user turn. Only the
+        # v3 (native tool_use) path hoists them; v1/v2 builders keep reading
+        # planner_input.instructions from their single prompt string.
+        if planner_input.instructions:
+            system = f"{system}\n\n{planner_input.instructions}"
 
         # TEMP debug toggle: BOW_FORCE_PARALLEL_TOOLS=true relaxes the
         # one-tool-per-turn rule so the multi-tool dispatch loop can be
@@ -461,22 +490,11 @@ Examples of good behavior:
         parts.append("<context>")
         parts.append(f"  <platform>{platform}</platform>")
         parts.append(f"  {PromptBuilder._format_platform_context(planner_input)}")
-        if planner_input.instructions:
-            parts.append(f"  {planner_input.instructions}")
-        if not getattr(planner_input, "allow_llm_see_data", True):
-            parts.append(
-                "  <data_visibility>Data privacy mode is ON for this organization "
-                "(allow_llm_see_data is off). Data tools (create_data, read_query) "
-                "return only columns, row_count and aggregate stats (counts, "
-                "mean/std/sum, date ranges) — never raw rows; inspect_data is "
-                "disabled. This is expected, not an error: do not retry to \"see\" "
-                "the data or attempt to retrieve individual values. Reason from the "
-                "structure and aggregates provided, and answer without quoting raw "
-                "rows.</data_visibility>"
-            )
-        # NOTE: schemas_combined is intentionally NOT emitted here — it now lives
-        # in the cached system prompt (see _build_system) so it's billed at the
-        # cache-read rate instead of re-sent at full price in every user turn.
+        # NOTE: schemas_combined, planner_input.instructions and the
+        # <data_visibility> block are intentionally NOT emitted here — they now
+        # live in the cached system prompt (see _build_system) so they're billed
+        # at the cache-read rate instead of re-sent at full price in every user
+        # turn.
         if getattr(planner_input, "files_context", None):
             parts.append(f"  {planner_input.files_context}")
         if getattr(planner_input, "resources_combined", None):

@@ -33,7 +33,7 @@ cheap ones dropped first.
 | Var | Default | Meaning |
 |---|---|---|
 | `BOW_RESULT_CACHE_ENABLED` | `0` (off) | Master switch |
-| `BOW_RESULT_CACHE_DIR` | `<tmp>/bow_result_cache` | Parquet cache directory |
+| `BOW_RESULT_CACHE_DIR` | `<tmp>/bow_result_cache/<pid>` | Parquet cache directory (default is per-worker-process; dead workers' dirs are reaped on startup) |
 | `BOW_RESULT_CACHE_MAX_BYTES` | 2 GiB | On-disk budget (triggers eviction) |
 | `BOW_RESULT_CACHE_TTL_SECONDS` | 300 | Freshness bound |
 | `BOW_RESULT_CACHE_MIN_COST_MS` | 250 | Don't cache queries cheaper than this |
@@ -55,8 +55,9 @@ cached result. Anything unanalyzable, or any execution error, falls back to a no
 Requires `sqlglot`; if absent, subsumption is silently disabled.
 
 ### Known limitations
-- TTL-only freshness — no version-token / change-feed invalidation yet. Stale-within-TTL
-  is the only guarantee; no force-refresh, no surfaced cache age.
+- Freshness is TTL plus a coarse version token (connection `updated_at` / data source
+  `last_synced_at` mixed into the scope, so config edits orphan old entries) — no
+  change-feed invalidation, no force-refresh, no surfaced cache age.
 - Cache spills plaintext Parquet to local disk — review for multi-tenant / sensitive data.
 
 ### Unified with streaming
@@ -153,6 +154,8 @@ use is therefore the model's choice for big results, never forced.
 - **`step.data` persistence** still serializes full results to JSON (memory/DB bloat).
 - **Live verification** — the Arrow/pagination overrides (BigQuery, ClickHouse, Spark,
   Mongo, Vertica, Druid, NetSuite, Salesforce, Athena) mirror each SDK's documented API
-  but have not been run against a live service. Blast radius is contained because
-  `execute_query_lazy` is separate and unused by the app today.
+  but have not been run against a live service. The coder agent prompt now offers
+  `execute_query_lazy` for large scans, so model-generated code does exercise it;
+  blast radius is contained because `execute_query` (DataFrame) remains the default
+  path and any lazy failure surfaces like a normal query error.
 - **Cache invalidation** beyond TTL, and at-rest encryption of spilled Parquet.

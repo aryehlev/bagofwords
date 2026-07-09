@@ -88,6 +88,7 @@ dependencies = [
     "pyyaml>=6.0.3,<6.1",
     "tiktoken>=0.13.0,<0.14",
     "rapidfuzz>=3.14.5,<3.15",
+    "sqlglot>=26.33.0,<27",
     "partialjson>=0.0.9,<0.1",
     "pathspec>=1.1.1,<1.2",
     "gitpython>=3.1.50,<3.2",

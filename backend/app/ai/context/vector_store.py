@@ -58,6 +58,23 @@ class VectorStore:
     ) -> Dict[str, str]:
         raise NotImplementedError
 
+    async def delete_owners(
+        self, organization_id: str, owner_type: str, owner_ids: List[str]
+    ) -> None:
+        """Hard-delete all embedding rows (any model_id) for the given owners."""
+        raise NotImplementedError
+
+    async def delete_stale_models(
+        self, organization_id: str, owner_type: str, active_model_id: str
+    ) -> None:
+        """Purge rows embedded under a model other than the active one.
+
+        A model switch changes ``model_id``, so re-indexing inserts fresh rows
+        while the old-model rows would otherwise linger forever (the upsert
+        conflict key includes model_id).
+        """
+        raise NotImplementedError
+
     async def query(
         self,
         *,
@@ -97,9 +114,11 @@ class PgVectorStore(VectorStore):
                 updated_at = EXCLUDED.updated_at
             """
         )
-        for r in rows:
-            await self.db.execute(
-                stmt,
+        # Single executemany round-trip instead of one INSERT per row (backfill
+        # batches are 128 rows).
+        await self.db.execute(
+            stmt,
+            [
                 {
                     "id": str(uuid.uuid4()),
                     "org": r.organization_id,
@@ -110,8 +129,44 @@ class PgVectorStore(VectorStore):
                     "dim": r.dim,
                     "vec": _vec_to_json(r.vector),
                     "now": now,
-                },
-            )
+                }
+                for r in rows
+            ],
+        )
+        await self.db.commit()
+
+    async def delete_owners(
+        self, organization_id: str, owner_type: str, owner_ids: List[str]
+    ) -> None:
+        if not owner_ids:
+            return
+        stmt = text(
+            """
+            DELETE FROM embeddings
+            WHERE organization_id = :org AND owner_type = :owner_type
+              AND owner_id IN :owner_ids
+            """
+        ).bindparams(bindparam("owner_ids", expanding=True))
+        await self.db.execute(
+            stmt,
+            {"org": organization_id, "owner_type": owner_type, "owner_ids": owner_ids},
+        )
+        await self.db.commit()
+
+    async def delete_stale_models(
+        self, organization_id: str, owner_type: str, active_model_id: str
+    ) -> None:
+        stmt = text(
+            """
+            DELETE FROM embeddings
+            WHERE organization_id = :org AND owner_type = :owner_type
+              AND model_id != :model_id
+            """
+        )
+        await self.db.execute(
+            stmt,
+            {"org": organization_id, "owner_type": owner_type, "model_id": active_model_id},
+        )
         await self.db.commit()
 
     async def existing_hashes(
@@ -150,6 +205,15 @@ class PgVectorStore(VectorStore):
         top_k: int,
         owner_ids: Optional[List[str]] = None,
     ) -> Optional[List[Tuple[str, float]]]:
+        # NOTE(scale): the HNSW index is *unfiltered* — ANN walks the global
+        # graph for the nearest candidates and only then applies the org /
+        # owner_type / model_id predicates, so a small tenant sharing a large
+        # table can get fewer than top_k (or zero) results even when it has
+        # matches. The composite btree ``ix_embeddings_lookup``
+        # (organization_id, owner_type, model_id) covers the planner's
+        # exact-scan fallback. Candidate mitigations at scale: pgvector >= 0.8
+        # iterative index scans (``hnsw.iterative_scan``), or partitioning the
+        # embeddings table by organization.
         params = {
             "org": organization_id,
             "owner_type": owner_type,
@@ -216,10 +280,11 @@ class LibsqlVectorStore(VectorStore):
                     updated_at = excluded.updated_at
                 """
             )
+            # Single executemany round-trip instead of one INSERT per row.
             with self.engine.begin() as conn:
-                for r in rows:
-                    conn.execute(
-                        stmt,
+                conn.execute(
+                    stmt,
+                    [
                         {
                             "id": str(uuid.uuid4()),
                             "org": r.organization_id,
@@ -230,8 +295,56 @@ class LibsqlVectorStore(VectorStore):
                             "dim": r.dim,
                             "vec": _vec_to_json(r.vector),
                             "now": now,
-                        },
-                    )
+                        }
+                        for r in rows
+                    ],
+                )
+
+        await self._run(_do)
+
+    async def delete_owners(
+        self, organization_id: str, owner_type: str, owner_ids: List[str]
+    ) -> None:
+        if not owner_ids:
+            return
+
+        def _do():
+            placeholders = ",".join(f":id{i}" for i in range(len(owner_ids)))
+            params = {f"id{i}": oid for i, oid in enumerate(owner_ids)}
+            params.update({"org": organization_id, "owner_type": owner_type})
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"""
+                        DELETE FROM embeddings
+                        WHERE organization_id = :org AND owner_type = :owner_type
+                          AND owner_id IN ({placeholders})
+                        """
+                    ),
+                    params,
+                )
+
+        await self._run(_do)
+
+    async def delete_stale_models(
+        self, organization_id: str, owner_type: str, active_model_id: str
+    ) -> None:
+        def _do():
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        DELETE FROM embeddings
+                        WHERE organization_id = :org AND owner_type = :owner_type
+                          AND model_id != :model_id
+                        """
+                    ),
+                    {
+                        "org": organization_id,
+                        "owner_type": owner_type,
+                        "model_id": active_model_id,
+                    },
+                )
 
         await self._run(_do)
 
@@ -271,6 +384,9 @@ class LibsqlVectorStore(VectorStore):
         top_k: int,
         owner_ids: Optional[List[str]] = None,
     ) -> Optional[List[Tuple[str, float]]]:
+        # NOTE(scale): no ANN index here — this is an exact scan over the rows
+        # matching the filters (fine at libSQL/single-node scale), so it does
+        # not have PgVectorStore.query's filtered-HNSW starvation issue.
         if owner_ids is not None and not owner_ids:
             return []
 

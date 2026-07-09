@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -82,30 +83,32 @@ def content_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
+@dataclass
+class PreparedQuery:
+    """A query embedded once (backend resolved once) for reuse across ranks."""
+
+    model_id: str
+    dim: int
+    vector: List[float]
+
+
 class SemanticSearch:
     def __init__(self, db: AsyncSession, organization: Organization, organization_settings=None):
         self.db = db
         self.organization = organization
         self.organization_settings = organization_settings
 
-    async def rank(
-        self,
-        query: str,
-        *,
-        owner_type: str,
-        top_k: int,
-        candidate_ids: Optional[List[str]] = None,
-    ) -> Optional[Dict[str, float]]:
-        """Return ``{owner_id: similarity}`` for the closest owners, or None.
+    async def prepare(self, query: str) -> Optional[PreparedQuery]:
+        """Embed ``query`` once for reuse across multiple :meth:`rank` calls.
 
-        ``None`` (fall back) is returned when the vector engine is unavailable,
-        the index is empty, or anything errors. An optional ``candidate_ids``
-        restricts the search to a known candidate set.
+        Callers that rank the same query against several owner sets (e.g. the
+        code-context success + failure passes) prepare here so the embedding
+        model isn't re-resolved and the query isn't re-embedded per call.
+        Returns ``None`` (fall back) when semantic search can't run.
         """
         if not query or not query.strip():
             return None
-        store = get_vector_store(self.db)
-        if store is None:
+        if get_vector_store(self.db) is None:
             return None
         try:
             svc = await build_embedding_service(
@@ -114,12 +117,47 @@ class SemanticSearch:
             qvec = await svc.embed_query(query)
             if not qvec:
                 return None
+            return PreparedQuery(model_id=svc.model_id, dim=svc.dim, vector=qvec)
+        except Exception as exc:
+            logger.warning("Semantic prepare failed; falling back: %s", exc)
+            return None
+
+    async def rank(
+        self,
+        query: str,
+        *,
+        owner_type: str,
+        top_k: int,
+        candidate_ids: Optional[List[str]] = None,
+        prepared: Optional[PreparedQuery] = None,
+    ) -> Optional[Dict[str, float]]:
+        """Return ``{owner_id: similarity}`` for the closest owners, or None.
+
+        ``None`` (fall back) is returned when the vector engine is unavailable,
+        the index is empty, or anything errors. An optional ``candidate_ids``
+        restricts the search to a known candidate set. Passing ``prepared``
+        (from :meth:`prepare`) skips re-embedding the query.
+        """
+        if not query or not query.strip():
+            return None
+        store = get_vector_store(self.db)
+        if store is None:
+            return None
+        try:
+            if prepared is None:
+                svc = await build_embedding_service(
+                    self.db, self.organization, self.organization_settings
+                )
+                qvec = await svc.embed_query(query)
+                if not qvec:
+                    return None
+                prepared = PreparedQuery(model_id=svc.model_id, dim=svc.dim, vector=qvec)
             results = await store.query(
                 organization_id=str(self.organization.id),
                 owner_type=owner_type,
-                query_vector=qvec,
-                model_id=svc.model_id,
-                dim=svc.dim,
+                query_vector=prepared.vector,
+                model_id=prepared.model_id,
+                dim=prepared.dim,
                 top_k=top_k,
                 owner_ids=candidate_ids,
             )
@@ -178,8 +216,42 @@ class SemanticSearch:
                 for (oid, _), vec in zip(changed, vectors, strict=True)
             ]
             await store.upsert(rows)
+            # A model switch changes model_id, so fresh rows land next to the
+            # old model's rows (the upsert conflict key includes model_id).
+            # Opportunistically purge the stale ones now that this owner_type
+            # has rows under the active model. Best-effort — never fail the
+            # index pass over cleanup.
+            try:
+                await store.delete_stale_models(
+                    str(self.organization.id), owner_type, svc.model_id
+                )
+            except Exception as exc:
+                logger.debug("Stale-model purge failed (owner_type=%s): %s",
+                             owner_type, exc)
             return len(rows)
         except Exception as exc:
             logger.warning("Semantic index_texts failed (owner_type=%s): %s",
                            owner_type, exc)
             return 0
+
+    async def purge_stale_model_rows(self, owner_type: str) -> None:
+        """Delete this org's rows embedded under a model other than the active one.
+
+        Explicit companion to the opportunistic purge in :meth:`index_texts`
+        (which only runs when something was re-embedded) — the backfill script
+        calls this so a model switch can't leave old-model rows behind even
+        when every row's content_hash is unchanged. Best-effort.
+        """
+        store = get_vector_store(self.db)
+        if store is None:
+            return
+        try:
+            svc = await build_embedding_service(
+                self.db, self.organization, self.organization_settings
+            )
+            await store.delete_stale_models(
+                str(self.organization.id), owner_type, svc.model_id
+            )
+        except Exception as exc:
+            logger.warning("Stale-model purge failed (owner_type=%s): %s",
+                           owner_type, exc)

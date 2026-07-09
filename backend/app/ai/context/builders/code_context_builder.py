@@ -14,7 +14,7 @@ from app.models.data_source import DataSource
 from app.models.table_usage_event import TableUsageEvent
 from app.models.table_feedback_event import TableFeedbackEvent
 from app.ai.context.sections.code_section import CodeSection
-from app.ai.context.semantic_search import SemanticSearch
+from app.ai.context.semantic_search import PreparedQuery, SemanticSearch
 
 # Cap the candidate set pulled for code-reuse ranking. Without it, the query
 # pulled EVERY step that ever used the current query's tables (O(usage history))
@@ -27,6 +27,10 @@ _CODE_CANDIDATE_CAP = 50
 # composite. When semantic search is unavailable (no embeddings / engine down)
 # this weight is redistributed back onto column-Jaccard so behavior is unchanged.
 _SEMANTIC_SUCCESS_WEIGHT = 0.35
+
+# Sentinel distinguishing "caller passed no prepared query" (compute one) from
+# "caller prepared and it came back None" (semantic unavailable — don't retry).
+_PREPARE_HERE = object()
 
 
 class CodeContextBuilder:
@@ -55,11 +59,18 @@ class CodeContextBuilder:
         time_window_days: Optional[int] = None,
     ) -> CodeSection:
         """Build a CodeSection with curated success and failure snippets for a data model."""
+        # Embed the data-model query text ONCE and share it across the success
+        # and failure passes below — both rank against the same
+        # _data_model_text, so preparing here halves the query-embedding calls
+        # (and the embedding-model resolution) on every agent turn.
+        prepared = await self._prepare_semantic_query(data_model)
         successes = await self.get_top_successful_snippets_for_data_model(
-            data_model, top_k=top_k_success, time_window_days=time_window_days
+            data_model, top_k=top_k_success, time_window_days=time_window_days,
+            prepared=prepared,
         )
         failures = await self.get_top_failed_snippets_for_data_model(
-            data_model, top_k=top_k_failure, time_window_days=time_window_days
+            data_model, top_k=top_k_failure, time_window_days=time_window_days,
+            prepared=prepared,
         )
 
         lines: list[str] = []
@@ -96,6 +107,7 @@ class CodeContextBuilder:
         *,
         top_k: int = 2,
         time_window_days: Optional[int] = None,
+        prepared=_PREPARE_HERE,
     ) -> List[Dict]:
         """Return top successful code snippets ranked by column-similarity, usage success, feedback, recency."""
         allowed_ds_ids, since_ts, now_utc = await self._get_access_and_time(time_window_days)
@@ -127,7 +139,7 @@ class CodeContextBuilder:
 
         fb_map = await self._load_feedback_map(allowed_ds_ids, since_ts)
         sem_scores = await self._semantic_step_scores(
-            data_model, [str(r[0]) for r in step_rows]
+            data_model, [str(r[0]) for r in step_rows], prepared=prepared
         )
         ranked: List[Tuple[float, Dict]] = []
         for step_id, step_dm, last_used_at, succ, fail, attempts in step_rows:
@@ -173,6 +185,7 @@ class CodeContextBuilder:
         *,
         top_k: int = 2,
         time_window_days: Optional[int] = None,
+        prepared=_PREPARE_HERE,
     ) -> List[Dict]:
         """Return top failed code snippets (anti-patterns) ranked by column similarity,
         recency, failure evidence (usage + negative feedback). Includes raw status_reason.
@@ -257,7 +270,7 @@ class CodeContextBuilder:
             )
 
         sem_scores = await self._semantic_step_scores(
-            data_model, [sid for sid, _ in tmp_holder]
+            data_model, [sid for sid, _ in tmp_holder], prepared=prepared
         )
         ranked: List[Tuple[float, Dict]] = []
         for sid, data in tmp_holder:
@@ -430,17 +443,37 @@ class CodeContextBuilder:
                         parts.append(desc.strip())
         return " ".join(parts)
 
+    async def _prepare_semantic_query(self, data_model: Dict) -> Optional[PreparedQuery]:
+        """Embed the data-model query once for reuse across ranking passes.
+
+        Returns None when semantic search can't run (matching rank()'s
+        degrade-to-None contract) — callers pass the result through so no pass
+        re-attempts the embedding.
+        """
+        query = self._data_model_text(data_model)
+        if not query:
+            return None
+        try:
+            return await SemanticSearch(self.db, self.organization).prepare(query)
+        except Exception:
+            return None
+
     async def _semantic_step_scores(
-        self, data_model: Dict, step_ids: List[str]
+        self, data_model: Dict, step_ids: List[str], prepared=_PREPARE_HERE
     ) -> Optional[Dict[str, float]]:
         """Embedding similarity for candidate steps, or None to skip blending."""
         query = self._data_model_text(data_model)
         if not query or not step_ids:
             return None
+        if prepared is None:
+            # The caller already prepared (and failed) the shared query
+            # embedding — skip instead of re-attempting per pass.
+            return None
         try:
             ss = SemanticSearch(self.db, self.organization)
             return await ss.rank(
-                query, owner_type="step", top_k=len(step_ids), candidate_ids=step_ids
+                query, owner_type="step", top_k=len(step_ids), candidate_ids=step_ids,
+                prepared=None if prepared is _PREPARE_HERE else prepared,
             )
         except Exception:
             return None

@@ -214,6 +214,7 @@ class Anthropic(LLMClient):
         tools: Optional[list[ToolSpec]] = None,
         images: Optional[list[ImageInput]] = None,
         enable_cache: bool = True,
+        cache_ttl: Optional[str] = None,
         thinking: Optional[dict] = None,
         disable_parallel_tools: bool = True,
     ) -> AsyncIterator[LLMStreamEvent]:
@@ -269,10 +270,16 @@ class Anthropic(LLMClient):
         # Both blocks are static across iterations within a session, so the
         # prefix is byte-identical → cache hits on iteration 2+.
         # See: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+        # cache_ttl (e.g. "1h") extends the default 5-minute ephemeral TTL for
+        # long-running flows (deep analytics), at 2× write cost instead of
+        # 1.25× — only worth it when planner calls can be >5min apart.
+        cache_control: dict[str, Any] = {"type": "ephemeral"}
+        if cache_ttl:
+            cache_control["ttl"] = cache_ttl
         if system:
             if enable_cache:
                 request_kwargs["system"] = [
-                    {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": system, "cache_control": cache_control},
                 ]
             else:
                 request_kwargs["system"] = system
@@ -281,7 +288,7 @@ class Anthropic(LLMClient):
             if enable_cache and translated:
                 # Put the breakpoint on the LAST tool — Anthropic caches everything
                 # up to and including the marked block.
-                translated[-1] = {**translated[-1], "cache_control": {"type": "ephemeral"}}
+                translated[-1] = {**translated[-1], "cache_control": cache_control}
             request_kwargs["tools"] = translated
             # Force-disable parallel tool_use at the API level. The model is
             # capable of emitting multiple tool_use blocks in one response,

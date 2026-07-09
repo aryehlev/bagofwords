@@ -40,21 +40,51 @@ logger = logging.getLogger(__name__)
 def _normalize_sql(sql: str) -> str:
     """Canonicalize a SQL string for keying.
 
-    Prefer sqlglot (collapses whitespace/casing/alias noise across dialects) but
-    fall back to a cheap whitespace+case normalization if it is unavailable or
-    cannot parse. The fallback is always safe: a worse normalization only lowers
-    the hit rate, it never produces a wrong hit (different SQL → different key).
+    Prefer sqlglot (collapses whitespace/casing/alias noise across dialects,
+    literal-aware) but fall back to exact matching (strip only) if it is
+    unavailable or cannot parse. The fallback must stay literal-preserving:
+    anything that rewrites string literals (lowercasing, collapsing inner
+    whitespace) would give `WHERE s='Active'` and `WHERE s='active'` one key and
+    serve wrong rows. Exact match only lowers the hit rate, never correctness.
     """
     try:
-        import sqlglot  # optional dependency
+        import sqlglot
 
         return sqlglot.transpile(sql, identify=True, pretty=False)[0]
     except Exception:
-        return " ".join(sql.split()).lower()
+        return sql.strip()
 
 
 def _default_cache_root() -> Path:
-    return Path(tempfile.gettempdir()) / "bow_result_cache"
+    # Per-pid subdirectory: uvicorn workers share one tmpdir but each process has
+    # its own in-memory index and byte budget, and `_sweep_orphans` on one
+    # worker's start must not delete files another live worker still references.
+    return Path(tempfile.gettempdir()) / "bow_result_cache" / str(os.getpid())
+
+
+def _reap_dead_sibling_roots(root: Path) -> None:
+    """Remove per-pid cache roots left behind by dead worker processes.
+
+    Only applies to the default `<tmp>/bow_result_cache/<pid>` layout; an
+    explicit BOW_RESULT_CACHE_DIR root has no pid siblings and is left alone."""
+    base = Path(tempfile.gettempdir()) / "bow_result_cache"
+    if root.parent != base or not base.is_dir():
+        return
+    for sibling in base.iterdir():
+        if sibling == root or not sibling.is_dir():
+            continue
+        try:
+            pid = int(sibling.name)
+        except ValueError:
+            continue
+        try:
+            os.kill(pid, 0)  # signal 0: existence probe, sends nothing
+        except ProcessLookupError:
+            import shutil
+
+            shutil.rmtree(sibling, ignore_errors=True)
+        except OSError:
+            pass  # e.g. EPERM: pid is alive but not ours — leave its cache be
 
 
 def _link_or_copy(src: Path, dst: Path) -> None:
@@ -154,6 +184,7 @@ class ResultLake:
             try:
                 self.config.root.mkdir(parents=True, exist_ok=True)
                 self._sweep_orphans()
+                _reap_dead_sibling_roots(self.config.root)
             except Exception:  # pragma: no cover - never block startup
                 logger.exception("ResultLake: failed to initialize cache root; disabling")
                 self.config.enabled = False
@@ -175,7 +206,17 @@ class ResultLake:
                     self._remove_locked(key)
                     return None
                 path = entry.path
-            df = pd.read_parquet(path)  # read outside the lock
+            try:
+                df = pd.read_parquet(path)  # read outside the lock
+            except Exception:
+                # Backing file is gone/unreadable (e.g. lost a same-key write
+                # race): evict the dangling index entry instead of letting every
+                # future lookup trip on it. Identity check — a concurrent re-put
+                # may have published a fresh entry under the same key/path.
+                with self._lock:
+                    if self._index.get(key) is entry:
+                        self._remove_locked(key)
+                return None
             with self._lock:
                 # entry may have been evicted concurrently; bumping a stale entry
                 # is harmless since we already hold the DataFrame.
@@ -202,8 +243,7 @@ class ResultLake:
             os.replace(tmp, path)  # atomic publish
             size = path.stat().st_size
             with self._lock:
-                if key in self._index:
-                    self._remove_locked(key)  # replace older copy, fix byte accounting
+                self._detach_locked(key, path)  # replace older copy, fix byte accounting
                 self._index[key] = CacheEntry(
                     key=key,
                     path=path,
@@ -239,7 +279,15 @@ class ResultLake:
             dest = Path(dest_dir)
             dest.mkdir(parents=True, exist_ok=True)
             out = dest / f"hit_{uuid.uuid4().hex}.parquet"
-            _link_or_copy(src, out)
+            try:
+                _link_or_copy(src, out)
+            except Exception:
+                # Backing file vanished — evict the dangling entry (same
+                # identity-checked cleanup as `get`) and miss.
+                with self._lock:
+                    if self._index.get(key) is entry:
+                        self._remove_locked(key)
+                return None
             with self._lock:
                 if key in self._index:
                     self._index[key].hits += 1
@@ -274,8 +322,7 @@ class ResultLake:
             os.replace(tmp, dest)  # atomic publish
             size = dest.stat().st_size
             with self._lock:
-                if key in self._index:
-                    self._remove_locked(key)
+                self._detach_locked(key, dest)
                 self._index[key] = CacheEntry(
                     key=key,
                     path=dest,
@@ -395,6 +442,23 @@ class ResultLake:
     def _key(self, scope: str, sql: str) -> str:
         raw = f"{scope}\x00{_normalize_sql(sql)}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _detach_locked(self, key: str, new_path: Path) -> None:
+        """Drop an index entry being replaced by a fresh write to `new_path`.
+
+        The cache filename is deterministic per key, so under a same-key write
+        race the old entry usually points at the very file we just published —
+        unlinking it (as `_remove_locked` does) would delete the new data and
+        leave a dangling entry. Only unlink when the old path actually differs;
+        otherwise just fix the byte accounting."""
+        entry = self._index.get(key)
+        if entry is None:
+            return
+        if entry.path == new_path:
+            self._index.pop(key)
+            self._total_bytes -= entry.size_bytes
+        else:
+            self._remove_locked(key)
 
     def _remove_locked(self, key: str) -> None:
         entry = self._index.pop(key, None)

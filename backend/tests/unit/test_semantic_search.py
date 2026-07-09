@@ -11,8 +11,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.ai.context import semantic_search as ss_mod
-from app.ai.context.semantic_search import SemanticSearch, content_hash
-from app.ai.context.vector_store import _vec_to_json
+from app.ai.context.semantic_search import PreparedQuery, SemanticSearch, content_hash
+from app.ai.context.vector_store import (
+    EmbeddingRow,
+    LibsqlVectorStore,
+    PgVectorStore,
+    _vec_to_json,
+)
 from app.ai.embeddings import local_embedder
 from app.services.embedding_service import EmbeddingService
 
@@ -114,6 +119,195 @@ async def test_index_texts_skips_unchanged(monkeypatch):
     assert n == 1  # only the changed/new one
     svc.embed_texts.assert_awaited_once_with(["new"])
     store.upsert.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_index_texts_purges_stale_model_rows(monkeypatch):
+    store = MagicMock()
+    store.existing_hashes = AsyncMock(return_value={})
+    store.upsert = AsyncMock()
+    store.delete_stale_models = AsyncMock()
+    monkeypatch.setattr(ss_mod, "get_vector_store", lambda db: store)
+    svc = SimpleNamespace(model_id="m2", dim=384, embed_texts=AsyncMock(return_value=[[0.2] * 384]))
+    monkeypatch.setattr(ss_mod, "build_embedding_service", AsyncMock(return_value=svc))
+    ss = SemanticSearch(MagicMock(), SimpleNamespace(id="o1"))
+
+    n = await ss.index_texts("instruction", [("a", "text")])
+    assert n == 1
+    # Old-model rows are purged opportunistically after a successful upsert.
+    store.delete_stale_models.assert_awaited_once_with("o1", "instruction", "m2")
+
+
+@pytest.mark.asyncio
+async def test_index_texts_survives_purge_failure(monkeypatch):
+    store = MagicMock()
+    store.existing_hashes = AsyncMock(return_value={})
+    store.upsert = AsyncMock()
+    store.delete_stale_models = AsyncMock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(ss_mod, "get_vector_store", lambda db: store)
+    svc = SimpleNamespace(model_id="m2", dim=384, embed_texts=AsyncMock(return_value=[[0.2] * 384]))
+    monkeypatch.setattr(ss_mod, "build_embedding_service", AsyncMock(return_value=svc))
+    ss = SemanticSearch(MagicMock(), SimpleNamespace(id="o1"))
+
+    # Purge failure is best-effort — the indexed count is still reported.
+    assert await ss.index_texts("instruction", [("a", "text")]) == 1
+
+
+# --- prepared-query reuse (one embed per agent turn) -------------------------
+
+@pytest.mark.asyncio
+async def test_prepare_embeds_once_and_rank_reuses(monkeypatch):
+    store = MagicMock()
+    store.query = AsyncMock(return_value=[("a", 0.9)])
+    monkeypatch.setattr(ss_mod, "get_vector_store", lambda db: store)
+    svc = SimpleNamespace(model_id="m", dim=384, embed_query=AsyncMock(return_value=[0.1] * 384))
+    build = AsyncMock(return_value=svc)
+    monkeypatch.setattr(ss_mod, "build_embedding_service", build)
+    ss = SemanticSearch(MagicMock(), SimpleNamespace(id="o1"))
+
+    prepared = await ss.prepare("revenue")
+    assert isinstance(prepared, PreparedQuery)
+    assert (prepared.model_id, prepared.dim) == ("m", 384)
+
+    out1 = await ss.rank("revenue", owner_type="step", top_k=5, prepared=prepared)
+    out2 = await ss.rank("revenue", owner_type="step", top_k=5, prepared=prepared)
+    assert out1 == out2 == {"a": 0.9}
+    # The model was resolved and the query embedded exactly once (in prepare).
+    build.assert_awaited_once()
+    svc.embed_query.assert_awaited_once()
+    assert store.query.await_args.kwargs["query_vector"] == prepared.vector
+
+
+@pytest.mark.asyncio
+async def test_prepare_none_when_store_unavailable(monkeypatch):
+    monkeypatch.setattr(ss_mod, "get_vector_store", lambda db: None)
+    ss = SemanticSearch(MagicMock(), SimpleNamespace(id="o1"))
+    assert await ss.prepare("revenue") is None
+
+
+@pytest.mark.asyncio
+async def test_code_builder_skips_when_prepared_unavailable(monkeypatch):
+    """A caller-supplied prepared=None (semantic unavailable) short-circuits
+    instead of re-attempting the embedding per ranking pass."""
+    from app.ai.context.builders import code_context_builder as ccb_mod
+    from app.ai.context.builders.code_context_builder import CodeContextBuilder
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("SemanticSearch should not be constructed")
+
+    monkeypatch.setattr(ccb_mod, "SemanticSearch", _boom)
+    cb = CodeContextBuilder.__new__(CodeContextBuilder)
+    cb.db, cb.organization = MagicMock(), SimpleNamespace(id="o1")
+    out = await cb._semantic_step_scores({"title": "Revenue"}, ["s1"], prepared=None)
+    assert out is None
+
+
+# --- store delete + batch upsert plumbing ------------------------------------
+
+def _row(owner_id: str) -> EmbeddingRow:
+    return EmbeddingRow(
+        organization_id="o1", owner_type="instruction", owner_id=owner_id,
+        content_hash=content_hash(owner_id), model_id="m", dim=3, vector=[0.1, 0.2, 0.3],
+    )
+
+
+@pytest.mark.asyncio
+async def test_pg_upsert_batches_rows_into_one_executemany():
+    db = MagicMock()
+    db.execute = AsyncMock()
+    db.commit = AsyncMock()
+    store = PgVectorStore(db)
+
+    await store.upsert([_row("a"), _row("b"), _row("c")])
+    db.execute.assert_awaited_once()
+    params = db.execute.await_args.args[1]
+    assert isinstance(params, list) and len(params) == 3
+    assert [p["owner_id"] for p in params] == ["a", "b", "c"]
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_libsql_upsert_batches_rows_into_one_executemany():
+    engine = MagicMock()
+    conn = engine.begin.return_value.__enter__.return_value
+    store = LibsqlVectorStore(engine)
+
+    await store.upsert([_row("a"), _row("b")])
+    conn.execute.assert_called_once()
+    params = conn.execute.call_args.args[1]
+    assert isinstance(params, list) and len(params) == 2
+    assert [p["owner_id"] for p in params] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_pg_delete_owners():
+    db = MagicMock()
+    db.execute = AsyncMock()
+    db.commit = AsyncMock()
+    store = PgVectorStore(db)
+
+    await store.delete_owners("o1", "instruction", ["a", "b"])
+    db.execute.assert_awaited_once()
+    params = db.execute.await_args.args[1]
+    assert params == {"org": "o1", "owner_type": "instruction", "owner_ids": ["a", "b"]}
+    db.commit.assert_awaited_once()
+
+    # Empty owner list is a no-op (no extra round-trip).
+    db.execute.reset_mock()
+    await store.delete_owners("o1", "instruction", [])
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_libsql_delete_owners_and_stale_models():
+    engine = MagicMock()
+    conn = engine.begin.return_value.__enter__.return_value
+    store = LibsqlVectorStore(engine)
+
+    await store.delete_owners("o1", "instruction", ["a"])
+    params = conn.execute.call_args.args[1]
+    assert params == {"id0": "a", "org": "o1", "owner_type": "instruction"}
+
+    conn.execute.reset_mock()
+    await store.delete_stale_models("o1", "step", "m-new")
+    params = conn.execute.call_args.args[1]
+    assert params == {"org": "o1", "owner_type": "step", "model_id": "m-new"}
+
+
+@pytest.mark.asyncio
+async def test_pg_delete_stale_models():
+    db = MagicMock()
+    db.execute = AsyncMock()
+    db.commit = AsyncMock()
+    store = PgVectorStore(db)
+
+    await store.delete_stale_models("o1", "step", "m-new")
+    params = db.execute.await_args.args[1]
+    assert params == {"org": "o1", "owner_type": "step", "model_id": "m-new"}
+    db.commit.assert_awaited_once()
+
+
+# --- step keep-fresh hook -----------------------------------------------------
+
+def test_schedule_index_step_delegates(monkeypatch):
+    from app.services import embedding_service as es_mod
+
+    calls = []
+    monkeypatch.setattr(
+        ss_mod, "schedule_index", lambda org, owner_type, items: calls.append((org, owner_type, items))
+    )
+    es_mod.schedule_index_step("o1", "s1", "revenue by region")
+    assert calls == [("o1", "step", [("s1", "revenue by region")])]
+
+
+def test_schedule_index_step_never_raises(monkeypatch):
+    from app.services import embedding_service as es_mod
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ss_mod, "schedule_index", _boom)
+    es_mod.schedule_index_step("o1", "s1", "text")  # must not raise
 
 
 # --- blending helpers -------------------------------------------------------

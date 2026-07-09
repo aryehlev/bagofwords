@@ -69,6 +69,59 @@ class EmbeddingService:
         return vecs[0] if vecs else []
 
 
+def data_model_embedding_text(data_model) -> str:
+    """Flatten a step's data_model dict into embeddable text.
+
+    Shared by the live step-completion hook and the backfill script
+    (``scripts/backfill_embeddings``) so the two can't drift — the vectors
+    only match the query side if both compose the same text.
+    """
+    parts: List[str] = []
+    if isinstance(data_model, dict):
+        for key in ("title", "name", "description"):
+            val = data_model.get(key)
+            if isinstance(val, str) and val.strip():
+                parts.append(val.strip())
+        for c in data_model.get("columns", []) or []:
+            if isinstance(c, dict):
+                name = c.get("generated_column_name") or c.get("name")
+                if name:
+                    parts.append(str(name))
+    return " ".join(parts)
+
+
+def step_embedding_text(data_model, prompt=None, title=None) -> str:
+    """Compose the canonical embeddable text for a step (data-model
+    title/columns + prompt + title). See :func:`data_model_embedding_text`."""
+    parts = [data_model_embedding_text(data_model or {})]
+    if prompt:
+        parts.append(str(prompt))
+    if title:
+        parts.append(str(title))
+    return " ".join(p for p in parts if p).strip()
+
+
+def schedule_index_step(organization_id: str, step_id: str, text: str) -> None:
+    """Fire-and-forget embedding refresh for a completed step.
+
+    Mirrors the instruction keep-fresh hook
+    (:func:`app.ai.context.semantic_search.schedule_index`): the embed + upsert
+    run off the request path on the dedicated indexing session. Best-effort —
+    never raises, so callers can invoke it unconditionally.
+
+    Called from the step-success path in ``agent_v2`` with text composed by
+    :func:`step_embedding_text` — the same composition the backfill script
+    uses.
+    """
+    try:
+        # Local import: semantic_search imports this module at top level.
+        from app.ai.context.semantic_search import schedule_index
+
+        schedule_index(str(organization_id), "step", [(str(step_id), text or "")])
+    except Exception as exc:
+        logger.debug("schedule_index_step failed (step_id=%s): %s", step_id, exc)
+
+
 def _get_setting(organization_settings, key, default=None):
     if organization_settings is None:
         return default

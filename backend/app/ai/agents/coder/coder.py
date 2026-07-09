@@ -175,8 +175,12 @@ class Coder:
         # Define data preview instruction based on enable_llm_see_data flag
         data_preview_instruction = f"- Also, after each query or DataFrame creation, print the data using: print('df head:', df.head())" if self.enable_llm_see_data else ""
 
-        similar_successful_code_snippets = await code_context_builder.get_top_successful_snippets_for_data_model(data_model)
-        similar_failed_code_snippets = await code_context_builder.get_top_failed_snippets_for_data_model(data_model)
+        # Prepare the semantic query once and share it across both snippet
+        # lookups — they rank against the identical data-model text, so
+        # preparing per call would embed the same query twice on the hot path.
+        prepared_query = await code_context_builder._prepare_semantic_query(data_model)
+        similar_successful_code_snippets = await code_context_builder.get_top_successful_snippets_for_data_model(data_model, prepared=prepared_query)
+        similar_failed_code_snippets = await code_context_builder.get_top_failed_snippets_for_data_model(data_model, prepared=prepared_query)
         text = f"""
         Role: data engineer and data scientist working on the user's analytics request.
 

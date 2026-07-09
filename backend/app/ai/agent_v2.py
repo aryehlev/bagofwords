@@ -264,6 +264,15 @@ class AgentV2:
         self._pending_writes: list[asyncio.Task] = []
         self._bg_write_failures: int = 0
 
+        # Table-usage emissions buffered during the run and flushed once at
+        # end of main_execution (mirrors the quota-flush pattern on
+        # UsageLimitContext). Writing TableUsageEvents mid-run bumps
+        # TableStats, and the next planner iteration rebuilds the schema
+        # context with fresh stats — a usage bump can then reorder the
+        # score-ranked tables, making the system prompt byte-different and
+        # busting the provider prompt cache mid-run. See _buffer_table_usage.
+        self._pending_table_usage: list[dict] = []
+
         # Coalesce rebuild_completion_from_blocks requests. Used to fire
         # twice per loop iteration (once after plan_decision saved, once
         # after tool_execution saved). They read the same set of blocks
@@ -384,7 +393,16 @@ class AgentV2:
                 usage_session_maker=async_session_maker,
                 usage_context=self.usage_limit_context,
             )
-        
+
+        # Deep-analytics runs regularly leave >5 minutes between planner calls
+        # (long tool/code executions), which outlives Anthropic's default
+        # ephemeral cache TTL — every iteration then repays the full cache
+        # write. Opt deep mode into the 1-hour TTL (2× write cost vs 1.25×,
+        # amortized over many iterations). Honored by the direct Anthropic
+        # client only; other providers ignore it (see LLM.inference_stream_v2).
+        if self.mode == "deep" and getattr(self.planner, "llm", None) is not None:
+            self.planner.llm.cache_ttl = "1h"
+
         # Tool runner with enhanced policies
         self.tool_runner = ToolRunner(
             retry=RetryPolicy(max_attempts=2, backoff_ms=500, backoff_multiplier=2.0, jitter_ms=200),
@@ -3753,6 +3771,20 @@ class AgentV2:
                     asyncio.create_task(_bg_flush(), name="agent.quota_flush")
                 except Exception:
                     pass
+            # Same pattern for the buffered table-usage emissions: deferred to
+            # end-of-run so mid-run TableStats bumps can't reorder the schema
+            # context and bust the prompt cache (see _buffer_table_usage).
+            # Runs on error/sigkill paths too — this finally covers them all.
+            if self._pending_table_usage:
+                async def _bg_table_usage_flush():
+                    try:
+                        await self._flush_table_usage()
+                    except Exception:
+                        logger.debug("table usage flush failed", exc_info=True)
+                try:
+                    asyncio.create_task(_bg_table_usage_flush(), name="agent.table_usage_flush")
+                except Exception:
+                    pass
 
     async def _build_planner_prompt_text(self, view=None) -> str:
         if view is None:
@@ -4448,6 +4480,60 @@ class AgentV2:
             logger.error(f"Error handling streaming event {stage} for {tool_name}: {e}")
             # Don't re-raise; this is streaming and shouldn't break the main flow
 
+    def _buffer_table_usage(self, **entry) -> None:
+        """Queue a table-usage emission for the end-of-run flush.
+
+        emit_table_usage bumps TableStats, and every planner iteration rebuilds
+        schemas_combined with fresh stats (schema_builder.build(with_stats=True));
+        stable-mode rendering keeps the SCORE-RANKED table order, so a mid-run
+        usage bump can reorder tables → byte-different system prompt → provider
+        prompt cache busted for the rest of the run. Buffering the emissions and
+        flushing once at end of run keeps the schema context frozen while the
+        loop is running. Entries carry only ids + JSON-safe payloads (never
+        session-bound ORM objects); _flush_table_usage re-fetches its own rows.
+        """
+        self._pending_table_usage.append(entry)
+
+    async def _flush_table_usage(self) -> None:
+        """Flush buffered table-usage emissions in one fresh session.
+
+        Scheduled from main_execution's finally block (mirroring the quota
+        flush), so success, error and sigkill paths all reach it. Entries
+        degrade independently — one bad row can't drop the rest.
+        """
+        entries, self._pending_table_usage = self._pending_table_usage, []
+        if not entries:
+            return
+        async with async_session_maker() as db:
+            for entry in entries:
+                try:
+                    report = await db.get(Report, entry["report_id"]) if entry.get("report_id") else None
+                    if report is None:
+                        continue
+                    step = await db.get(Step, entry["step_id"]) if entry.get("step_id") else None
+                    if entry.get("kind") == "data_model":
+                        await self.project_manager.emit_table_usage(
+                            db=db,
+                            report=report,
+                            step=step,
+                            data_model=entry.get("data_model") or {},
+                            user_id=entry.get("user_id"),
+                            user_role=entry.get("user_role"),
+                        )
+                    else:
+                        await self.project_manager.emit_table_usage_from_tables_by_source(
+                            db=db,
+                            report=report,
+                            step=step,
+                            tables_by_source=entry.get("tables_by_source"),
+                            user_id=entry.get("user_id"),
+                            user_role=entry.get("user_role"),
+                            source_type=entry.get("source_type") or "sql",
+                        )
+                except Exception:
+                    logger.debug("table usage flush entry failed", exc_info=True)
+            await db.commit()
+
     async def _handle_tool_output(self, tool_name: str, tool_input: dict, observation: dict, tool_output: dict = None):
         """Handle tool outputs and manage final state updates.
 
@@ -4482,7 +4568,8 @@ class AgentV2:
             async with self._writes_session() as fresh_db:
                 # Re-fetch only the rows we'll need; cheaper than refreshing
                 # every relationship and bounded to this method's scope.
-                report_obj = await fresh_db.get(Report, report_id) if report_id else None
+                # (Report is no longer needed here — table-usage emission is
+                # buffered and re-fetches its own rows at flush time.)
                 exec_obj = await fresh_db.get(AgentExecution, exec_id) if exec_id else None
 
                 if tool_name in ["create_widget", "create_data", "describe_entity", "write_csv"]:
@@ -4536,20 +4623,47 @@ class AgentV2:
                             fresh_db, step_obj, "success"
                         )
 
-                        # Emit table usage events based on the step's data model (align with legacy agent)
+                        # Keep step embeddings fresh: without this, only the
+                        # manual backfill script produces step vectors, so the
+                        # semantic snippet ranking silently decays to Jaccard
+                        # for every step created after the last backfill run.
+                        # Fire-and-forget on the indexing session — never
+                        # blocks or fails the run.
                         try:
-                            await self.project_manager.emit_table_usage(
-                                db=fresh_db,
-                                report=report_obj,
-                                step=step_obj,
-                                data_model=getattr(step_obj, "data_model", {}) or {},
-                                user_id=head_user_id,
-                                user_role=None
+                            from app.services.embedding_service import (
+                                schedule_index_step,
+                                step_embedding_text,
+                            )
+                            schedule_index_step(
+                                str(self.organization.id),
+                                str(step_obj.id),
+                                step_embedding_text(
+                                    dict(getattr(step_obj, "data_model", {}) or {}),
+                                    prompt=getattr(step_obj, "prompt", None),
+                                    title=getattr(step_obj, "title", None),
+                                ),
                             )
                         except Exception:
                             pass
 
-                        # Fallback for create_data: if no columns in data_model, emit usage from tool_input.tables_by_source
+                        # Buffer table usage events based on the step's data model
+                        # (align with legacy agent). NOT emitted inline: writing the
+                        # TableUsageEvent here would bump TableStats and reorder the
+                        # score-ranked schema context on the next planner iteration,
+                        # busting the prompt cache mid-run. Flushed at end of run.
+                        try:
+                            self._buffer_table_usage(
+                                kind="data_model",
+                                report_id=report_id,
+                                step_id=step_id,
+                                data_model=dict(getattr(step_obj, "data_model", {}) or {}),
+                                user_id=head_user_id,
+                                user_role=None,
+                            )
+                        except Exception:
+                            pass
+
+                        # Fallback for create_data: if no columns in data_model, buffer usage from tool_input.tables_by_source
                         try:
                             if tool_name == "create_data":
                                 dm = getattr(step_obj, "data_model", {}) or {}
@@ -4558,10 +4672,10 @@ class AgentV2:
                                 if not has_columns and isinstance(tool_input, dict):
                                     tbs = tool_input.get("tables_by_source")
                                     if tbs:
-                                        await self.project_manager.emit_table_usage_from_tables_by_source(
-                                            db=fresh_db,
-                                            report=report_obj,
-                                            step=step_obj,
+                                        self._buffer_table_usage(
+                                            kind="tables_by_source",
+                                            report_id=report_id,
+                                            step_id=step_id,
                                             tables_by_source=tbs,
                                             user_id=head_user_id,
                                             user_role=None,
@@ -4625,15 +4739,15 @@ class AgentV2:
                         observation["step_id"] = step_id
 
                 elif tool_name == "inspect_data":
-                    # Track table usage for inspection
+                    # Track table usage for inspection (buffered — see above)
                     try:
                         if isinstance(tool_input, dict):
                             tbs = tool_input.get("tables_by_source")
                             if tbs:
-                                await self.project_manager.emit_table_usage_from_tables_by_source(
-                                    db=fresh_db,
-                                    report=report_obj,
-                                    step=None,
+                                self._buffer_table_usage(
+                                    kind="tables_by_source",
+                                    report_id=report_id,
+                                    step_id=None,
                                     tables_by_source=tbs,
                                     user_id=head_user_id,
                                     user_role=None,

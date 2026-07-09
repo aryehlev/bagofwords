@@ -2,6 +2,7 @@ from app.data_sources.clients.base import DataSourceClient
 from app.ai.prompt_formatters import Table, TableColumn, ServiceFormatter
 from pymongo import MongoClient
 from bson import ObjectId
+from bson.decimal128 import Decimal128
 import pandas as pd
 import json
 from typing import List, Optional, Generator
@@ -195,7 +196,11 @@ class MongodbClient(DataSourceClient):
                         for k, v in doc.items()
                     }
 
-        return consume_row_dicts_to_lazyframe(docs(), config=cfg)
+        gen = docs()
+        try:
+            return consume_row_dicts_to_lazyframe(gen, config=cfg)
+        finally:
+            gen.close()  # deterministic connection cleanup on error paths
 
     def _convert_bson_types(self, doc: dict) -> None:
         """Recursively convert BSON types to JSON-serializable types."""
@@ -206,6 +211,11 @@ class MongodbClient(DataSourceClient):
                 doc[key] = value.isoformat()
             elif isinstance(value, bytes):
                 doc[key] = value.decode('utf-8', errors='replace')
+            elif isinstance(value, Decimal128):
+                # Common for money fields; pyarrow can't infer Decimal128 so the
+                # lazy Parquet spill would fail. Float is lossy past ~15
+                # significant digits but keeps the column numeric.
+                doc[key] = float(value.to_decimal())
             elif isinstance(value, dict):
                 self._convert_bson_types(value)
             elif isinstance(value, list):
@@ -216,6 +226,8 @@ class MongodbClient(DataSourceClient):
                         value[i] = str(item)
                     elif isinstance(item, datetime):
                         value[i] = item.isoformat()
+                    elif isinstance(item, Decimal128):
+                        value[i] = float(item.to_decimal())
     
     def _get_all_keys(self, collection, sample_size: int = 100) -> dict:
         """Get union of all keys from sampled documents, with sample values for type inference.

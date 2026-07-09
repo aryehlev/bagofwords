@@ -2122,6 +2122,15 @@ class DataSourceService:
             if (getattr(connection, "auth_policy", None) or "system_only") == "user_required" and current_user is not None:
                 cache_identity = f"user:{current_user.id}"
             setattr(client, "_bow_cache_identity", cache_identity)
+            # Result-cache version token: bumps whenever the connection config is
+            # edited or the data source re-synced, so the cache scope changes and
+            # entries built against the old config are orphaned instead of served
+            # stale until TTL.
+            setattr(
+                client,
+                "_bow_cache_version",
+                f"{getattr(connection, 'updated_at', '') or ''}|{getattr(data_source, 'last_synced_at', '') or ''}",
+            )
             # Per-connection query timeout override (read by the code-execution
             # wrapper). Stored on the client so the wrapper does not need DB
             # access to resolve it.

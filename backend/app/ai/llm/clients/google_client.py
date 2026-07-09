@@ -81,7 +81,14 @@ class _GeminiCacheManager:
     def __init__(self) -> None:
         # key -> (cache_name, local_expiry_monotonic)
         self._entries: dict[str, tuple[str, float]] = {}
+        # Global lock guards DICT ACCESS ONLY (_entries / _key_locks). The
+        # slow caches.create() network call runs under a per-key lock instead,
+        # so a cache miss for one prefix never serializes Gemini traffic for
+        # every other prefix (or model/credential) in the process.
         self._lock = asyncio.Lock()
+        # key -> per-key creation lock; concurrent misses on the SAME prefix
+        # still coalesce into a single create round-trip.
+        self._key_locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
     def _signature(
@@ -122,12 +129,24 @@ class _GeminiCacheManager:
             return None, 0
 
         key = self._signature(cred_id, model_id, system, tools_payload)
-        now = time.monotonic()
 
+        # Fast path: valid entry already registered (dict access only).
         async with self._lock:
             entry = self._entries.get(key)
-            if entry and entry[1] > now:
+            if entry and entry[1] > time.monotonic():
                 return entry[0], 0
+            key_lock = self._key_locks.get(key)
+            if key_lock is None:
+                key_lock = asyncio.Lock()
+                self._key_locks[key] = key_lock
+
+        async with key_lock:
+            # Re-check under the per-key lock: another waiter for this same
+            # prefix may have finished the create while we queued.
+            async with self._lock:
+                entry = self._entries.get(key)
+                if entry and entry[1] > time.monotonic():
+                    return entry[0], 0
 
             ttl = _cache_ttl_seconds()
             cfg_kwargs: dict = {"ttl": f"{ttl}s", "display_name": f"bow-prefix-{key[:16]}"}
@@ -162,7 +181,8 @@ class _GeminiCacheManager:
             creation_tokens = getattr(cache_meta, "total_token_count", 0) or 0
             # Expire locally 60s before the server TTL to avoid a race where we
             # reference a cache the server has just evicted.
-            self._entries[key] = (name, now + max(30, ttl - 60))
+            async with self._lock:
+                self._entries[key] = (name, time.monotonic() + max(30, ttl - 60))
             logger.debug(
                 "Gemini explicit cache created (model=%s, name=%s, ttl=%ss, ~%s tokens, "
                 "creation_tokens=%s)",
@@ -171,6 +191,9 @@ class _GeminiCacheManager:
             return name, creation_tokens
 
     async def evict(self, name: str) -> None:
+        # The per-key locks stay registered — a subsequent miss on the same
+        # prefix reuses them, and the map is bounded by distinct prefixes just
+        # like _entries.
         async with self._lock:
             for key, (cname, _) in list(self._entries.items()):
                 if cname == name:

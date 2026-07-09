@@ -459,6 +459,11 @@ class InstructionContextBuilder:
             query, [str(i.id) for i in all_instructions]
         )
 
+        # Stable candidate order (DB row order is not guaranteed) so that the
+        # score-descending sort below breaks ties deterministically and the
+        # rendered block stays byte-stable across rebuilds (prompt-cache safe).
+        all_instructions = sorted(all_instructions, key=lambda i: str(i.id))
+
         # Score and filter by keyword/semantic match (or include all if no query).
         # Gate the "no query" branch on the raw query text, not on derived
         # keywords/scores: an all-stopword/punctuation query with semantic search
@@ -593,6 +598,11 @@ class InstructionContextBuilder:
 
         # Apply per-user table accessibility (same rule as loaded instructions).
         skills = await self._filter_instructions_by_table_accessibility(skills)
+
+        # Deterministic order: the catalog renders inside the cached system
+        # prompt (via InstructionsSection), so both the ordering and the
+        # limit-truncation below must be byte-stable across rebuilds.
+        skills = sorted(skills, key=lambda s: str(s.id))
 
         items: List[SkillCatalogItem] = []
         for s in skills[:limit]:
@@ -794,11 +804,17 @@ class InstructionContextBuilder:
                         build_number=build.build_number,
                     )
                     scored.append((item, score))
-            
-            # Sort by score descending and take top N
-            scored.sort(key=lambda x: x[1], reverse=True)
+
+            # Sort by score descending, id ascending as tie-break, take top N.
+            scored.sort(key=lambda x: (-x[1], x[0].id))
             intelligent_items = [item for item, _ in scored[:remaining_slots]]
-        
+
+        # Deterministic ordering: the rendered <instructions> block is embedded
+        # in the planner's CACHED system prompt (prompt_builder_v3), so it must
+        # be byte-identical across rebuilds for the same inputs. DB row order is
+        # not guaranteed (no ORDER BY), so sort 'always' items by id and break
+        # intelligent-score ties by id (above) instead of relying on it.
+        always_items.sort(key=lambda it: it.id)
         items = always_items + intelligent_items
 
         # Load referenced instructions (dependencies)
@@ -867,7 +883,12 @@ class InstructionContextBuilder:
         # Deduplicate and build items with tracking
         seen_ids: Set[str] = set()
         items: List[InstructionItem] = []
-        
+
+        # Deterministic ordering (see _load_from_build): sort 'always' by id so
+        # the rendered block is byte-stable across rebuilds regardless of DB
+        # row order. Intelligent results are already (score desc, id) sorted.
+        always_instructions = sorted(always_instructions, key=lambda i: str(i.id))
+
         # Add always instructions first (they all get loaded)
         for inst in always_instructions:
             inst_id = str(inst.id)
@@ -975,6 +996,9 @@ class InstructionContextBuilder:
                 )
             )
             contents = contents_result.scalars().all()
+            # Deterministic order (byte-stable render + stable truncation when
+            # remaining_slots caps the deps) — DB row order is not guaranteed.
+            contents = sorted(contents, key=lambda c: str(c.instruction_id))
 
             usage_counts = await self._batch_load_usage_counts(list(missing_ids))
 
@@ -1021,6 +1045,8 @@ class InstructionContextBuilder:
                 )
             )
             instructions = inst_result.scalars().all()
+            # Deterministic order — same rationale as the build-mode branch.
+            instructions = sorted(instructions, key=lambda i: str(i.id))
 
             usage_counts = await self._batch_load_usage_counts(list(missing_ids))
 

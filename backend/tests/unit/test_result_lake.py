@@ -44,6 +44,19 @@ def test_normalization_collapses_whitespace_and_case(tmp_path, df):
     assert lake.get("scope", "select   *   from   t") is not None
 
 
+def test_fallback_normalization_preserves_string_literals(tmp_path, df, monkeypatch):
+    """With sqlglot unavailable the fallback key must be exact-match: queries
+    differing only inside a string literal (case, or whitespace) must NOT share
+    a cache entry — merging them would serve one literal's rows for the other."""
+    import sys
+    monkeypatch.setitem(sys.modules, "sqlglot", None)  # force ImportError → fallback
+    lake = ResultLake(_cfg(tmp_path))
+    lake.put("s", "SELECT * FROM t WHERE s = 'Active'", df, cost_ms=500)
+    assert lake.get("s", "SELECT * FROM t WHERE s = 'active'") is None
+    lake.put("s", "SELECT * FROM t WHERE s = 'a b'", df, cost_ms=500)
+    assert lake.get("s", "SELECT * FROM t WHERE s = 'a  b'") is None
+
+
 def test_scope_isolation(tmp_path, df):
     lake = ResultLake(_cfg(tmp_path))
     lake.put("scopeA", "SELECT * FROM t", df, cost_ms=500)
@@ -90,6 +103,43 @@ def test_cost_aware_eviction_keeps_expensive(tmp_path):
     # The expensive (high value/byte) entry must survive eviction; a cheaper
     # one is dropped instead.
     assert lake.get("s", "q_expensive") is not None
+
+
+def test_same_key_reput_keeps_entry_readable(tmp_path, df):
+    """The cache filename is deterministic per key: replacing an entry must not
+    unlink the freshly published file (same-key write race), and byte accounting
+    must not double-count the replaced copy."""
+    lake = ResultLake(_cfg(tmp_path))
+    lake.put("s", "SELECT * FROM t", df, cost_ms=500)
+    df2 = df.assign(a=df.a + 1)
+    lake.put("s", "SELECT * FROM t", df2, cost_ms=500)
+    got = lake.get("s", "SELECT * FROM t")
+    assert got is not None and got.equals(df2)
+    stats = lake.stats()
+    assert stats["entries"] == 1
+    assert stats["total_bytes"] > 0
+
+
+def test_get_evicts_entry_when_backing_file_missing(tmp_path, df):
+    """A read failure (file deleted out from under the index) must evict the
+    dangling entry instead of leaving it to trip every future lookup."""
+    lake = ResultLake(_cfg(tmp_path))
+    lake.put("s", "q", df, cost_ms=500)
+    for p in tmp_path.glob("*.parquet"):
+        p.unlink()
+    assert lake.get("s", "q") is None
+    stats = lake.stats()
+    assert stats["entries"] == 0 and stats["total_bytes"] == 0
+
+
+def test_owned_copy_evicts_entry_when_backing_file_missing(tmp_path, df):
+    """Same dangling-entry eviction, via the lazy-path lookup."""
+    lake = ResultLake(_cfg(tmp_path / "cache"))
+    lake.put("s", "q", df, cost_ms=500)
+    for p in (tmp_path / "cache").glob("*.parquet"):
+        p.unlink()
+    assert lake.get_owned_copy("s", "q", "", tmp_path / "dest") is None
+    assert lake.stats()["entries"] == 0
 
 
 def test_disabled_cache_always_misses(tmp_path, df):

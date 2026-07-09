@@ -594,6 +594,10 @@ class QueryCapturingClientWrapper:
             # Per-user identity for user_required/delegated connections so two users
             # sharing one connection never share cached rows (empty for shared creds).
             getattr(self._original, "_bow_cache_identity", "") or "",
+            # Version token (connection updated_at / data source last_synced_at):
+            # editing a connection's config orphans its old cache entries by key
+            # instead of serving stale rows until TTL.
+            getattr(self._original, "_bow_cache_version", "") or "",
         ))
 
     def _cache_get(self, query):
@@ -635,7 +639,16 @@ class QueryCapturingClientWrapper:
                 path = lake.get_subsuming_path(scope, query, source_class, dest)
             if path is None:
                 return None
-            return LazyFrame.from_parquet(path, owns_source=True)
+            try:
+                return LazyFrame.from_parquet(path, owns_source=True)
+            except Exception:
+                # The LazyFrame never took ownership, and the bow_lazy dir has
+                # no orphan sweep — remove the private copy or it leaks.
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return None
         except Exception:
             return None
 

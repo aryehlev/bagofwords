@@ -20,6 +20,7 @@ from .types import (
 )
 from app.ai.utils.token_counter import count_tokens, estimate_tokens_fast
 from app.models.llm_model import LLMModel
+from app.ai.llm.cache_accounting import cache_tokens_are_additive
 from app.ai.llm.usage_attribution import get_usage_attribution
 from app.services.llm_usage_recorder import LLMUsageRecorderService
 from app.services.usage_policy_service import UsageLimitContext, usage_policy_service
@@ -82,6 +83,12 @@ class LLM:
                 raise
         self._usage_session_maker = usage_session_maker
         self._usage_limit_context = usage_context
+        # Optional prompt-cache TTL override (e.g. "1h"). Set by the owner of a
+        # long-running flow (AgentV2 sets "1h" for deep mode) so the cached
+        # prefix survives multi-minute gaps between planner calls instead of
+        # expiring at the 5-minute default and repaying full cache writes.
+        # Honored by the direct Anthropic client only — see inference_stream_v2.
+        self.cache_ttl: Optional[str] = None
         additional_config = self.model.provider.additional_config or {}
         enable_web_search = bool(additional_config.get("enable_web_search", False))
         if self.provider == "openai":
@@ -396,6 +403,11 @@ class LLM:
                 client_kwargs["web_search"] = web_search
                 if web_search_domains:
                     client_kwargs["web_search_domains"] = web_search_domains
+            # Extended cache TTL is an Anthropic-API feature
+            # ({"type": "ephemeral", "ttl": "1h"}); Bedrock's converse API has
+            # no TTL knob on cachePoint, so forward only to the direct client.
+            if self.cache_ttl and isinstance(self.client, Anthropic):
+                client_kwargs["cache_ttl"] = self.cache_ttl
 
             try:
                 async for evt in self.client.inference_stream_v2(
@@ -625,8 +637,9 @@ class LLM:
         # Anthropic and Bedrock report cache read/write tokens SEPARATELY from
         # the prompt token count, so they must be added in for an accurate quota.
         # (Gemini/OpenAI fold cached tokens into prompt_tokens already — adding
-        # them here would double-count.)
-        if self.provider in ("anthropic", "bedrock"):
+        # them here would double-count.) The provider classification is shared
+        # with the cost recorder — see app.ai.llm.cache_accounting.
+        if cache_tokens_are_additive(self.provider):
             total += (cache_read_tokens or 0) + (cache_creation_tokens or 0)
         return max(int(total), 0)
 

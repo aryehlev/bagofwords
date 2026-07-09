@@ -268,12 +268,18 @@ class InstructionService:
         except Exception:
             pass
 
-        # Keep-fresh: refresh this instruction's embedding off the request path.
+        # Keep-fresh: refresh this instruction's embedding off the request path —
+        # but only when the instruction actually went live in the main build.
+        # Mirrors the update_instruction policy: embeddings track the LIVE
+        # main-build text, so a build left in pending_approval (non-admin
+        # create) or deferred finalization (agent batching) is indexed by
+        # BuildService.promote_build if/when it is promoted, not here.
         try:
-            from app.ai.context.semantic_search import schedule_index
-            schedule_index(
-                str(organization.id), "instruction", [(str(instruction.id), instruction.text or "")]
-            )
+            if finalized and bool(getattr(target_build, "is_main", False)):
+                from app.ai.context.semantic_search import schedule_index
+                schedule_index(
+                    str(organization.id), "instruction", [(str(instruction.id), instruction.text or "")]
+                )
         except Exception:
             pass
 
@@ -1776,6 +1782,21 @@ class InstructionService:
             logger.warning(f"Failed to update build for deleted instruction {instruction_id}: {e}")
             # Don't fail the deletion if build update fails
 
+        # Drop the instruction's semantic embeddings so deleted (possibly
+        # rejected/private) text stops being retained and retrievable in the
+        # vector index. Best-effort — never fail the deletion over cleanup.
+        try:
+            from app.ai.context.vector_store import get_vector_store
+            store = get_vector_store(db)
+            if store is not None:
+                await store.delete_owners(str(organization.id), "instruction", [str(instruction.id)])
+        except Exception as e:
+            logger.warning(f"Failed to delete embeddings for instruction {instruction_id}: {e}")
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
         # Audit log
         try:
             await audit_service.log(
@@ -2077,8 +2098,9 @@ class InstructionService:
         user_permissions = await self._get_user_permissions(db, current_user, organization)
         
         deleted_count = 0
+        deleted_ids: List[str] = []
         failed_ids = []
-        
+
         # Fetch all instructions by IDs
         result = await db.execute(
             select(Instruction)
@@ -2122,6 +2144,7 @@ class InstructionService:
                         logger.warning(f"Failed to remove instruction {instruction.id} from build: {e}")
                 
                 deleted_count += 1
+                deleted_ids.append(str(instruction.id))
             except Exception as e:
                 failed_ids.append(str(instruction.id))
                 logger.warning(f"Failed to delete instruction {instruction.id}: {e}")
@@ -2140,7 +2163,23 @@ class InstructionService:
                     logger.debug(f"Auto-promoted bulk delete build {bulk_build.id} to main")
             except Exception as finalize_error:
                 logger.warning(f"Failed to finalize/promote bulk delete build: {finalize_error}")
-        
+
+        # Drop semantic embeddings for the deleted instructions so their text
+        # stops being retained/retrievable in the vector index. Best-effort —
+        # never fail the bulk delete over cleanup.
+        if deleted_ids:
+            try:
+                from app.ai.context.vector_store import get_vector_store
+                store = get_vector_store(db)
+                if store is not None:
+                    await store.delete_owners(str(organization.id), "instruction", deleted_ids)
+            except Exception as e:
+                logger.warning(f"Failed to delete embeddings for bulk-deleted instructions: {e}")
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+
         return InstructionBulkResponse(
             updated_count=deleted_count,
             failed_ids=failed_ids,

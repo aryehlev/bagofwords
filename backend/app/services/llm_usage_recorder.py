@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.llm.cache_accounting import cache_tokens_are_additive
 from app.models.llm_model import LLMModel
 from app.models.llm_usage_record import LLMUsageRecord
 
@@ -74,10 +75,13 @@ class LLMUsageRecorderService:
         if rate is None:
             return 0.0
         rate_f = float(rate)
-        # Non-cached input tokens at full rate (Anthropic excludes cached tokens
-        # from input_tokens; OpenAI includes them, so we handle both below).
+        # Non-cached input tokens at full rate (Anthropic/Bedrock exclude cached
+        # tokens from input_tokens; OpenAI includes them, so we handle both
+        # below — see app.ai.llm.cache_accounting for the classification).
         cost = (tokens / 1_000_000) * rate_f if tokens else 0.0
-        if provider_type == "anthropic":
+        if cache_tokens_are_additive(provider_type):
+            # Anthropic + Bedrock (which serves Anthropic models with the same
+            # cache pricing) report cache tokens additively.
             # Cache reads: billed at 0.1× input rate.
             # Cache writes: billed at 1.25× input rate.
             if cache_read_tokens:
