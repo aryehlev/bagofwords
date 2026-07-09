@@ -10,6 +10,7 @@ async def build_codegen_context(
     interpreted_prompt: str | None,
     schemas_excerpt: str,
     tables_by_source: list | None = None,
+    data_profile_context: str = "",
 ) -> CodeGenContext:
     """
     Build a CodeGenContext from runtime_ctx (ContextHub/ContextView) with safe fallbacks.
@@ -150,6 +151,7 @@ async def build_codegen_context(
         interpreted_prompt=interpreted_prompt or None,
         schemas_excerpt=schemas_excerpt or "",
         data_sources_context=data_sources_context,
+        data_profile_context=data_profile_context or "",
         instructions_context=instructions_context,
         mentions_context=mentions_context,
         entities_context=entities_context,

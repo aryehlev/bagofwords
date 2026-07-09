@@ -10,6 +10,10 @@ class CodeGenContext(BaseModel):
     schemas_excerpt: str
     # New: rendered descriptions of connected data sources/clients (LLM-ready text)
     data_sources_context: str = ""
+    # Learned data profile (value dictionaries, join keys, cost) rendered for the
+    # coder — see app/ai/query_intelligence/profile_formatter.py. Empty when the
+    # feature is disabled or no profile exists yet.
+    data_profile_context: str = ""
     instructions_context: str = ""
     mentions_context: str = "<mentions>No mentions for this turn</mentions>"
     entities_context: str = ""

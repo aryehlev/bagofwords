@@ -382,8 +382,32 @@ class QueryCapturingClientWrapper:
             else DEFAULT_QUERY_TIMEOUT_SECONDS
         )
 
+    def _maybe_optimize(self, query):
+        """Run the query-intelligence rewrite/lint pass. Returns (sql, notes,
+        warnings). Always safe: any failure returns the original query.
+
+        Only provably-safe rewrites are applied, and only when the operator has
+        opted in (BOW_QUERY_INTEL_ENABLED + BOW_QUERY_INTEL_REWRITE). Lint
+        warnings are collected regardless and surfaced on the timing entry so the
+        planner can see them even when rewriting is off.
+        """
+        if not isinstance(query, str) or not query.strip():
+            return query, [], []
+        try:
+            from app.ai.query_intelligence.config import get_qi_config
+            cfg = get_qi_config()
+            if not cfg.enabled:
+                return query, [], []
+            from app.ai.query_intelligence.sql_optimizer import optimize_sql
+            source_type = getattr(self._original, "_bow_connection_type", None)
+            res = optimize_sql(query, source_type=source_type, config=cfg)
+            return res.sql, res.notes, res.warnings
+        except Exception:
+            return query, [], []
+
     def execute_query(self, query: str, *args, **kwargs):
         """Intercept execute_query calls to capture the query string and wall-clock duration."""
+        query, _opt_notes, _opt_warnings = self._maybe_optimize(query)
         if isinstance(query, str):
             self._captured_queries.append(query)
         idx = len(self._captured_timings)
@@ -405,14 +429,17 @@ class QueryCapturingClientWrapper:
                     if rows is not None:
                         span.set_attribute("datasource.result_rows", rows)
                     span.set_attribute("datasource.result_bytes", result_bytes)
-                    self._captured_timings.append({
+                    _hit_timing = {
                         "index": idx,
                         "query_ms": round(_q_ms, 1),
                         "rows": rows,
                         "result_bytes": result_bytes,
                         "sql": query[:500] if isinstance(query, str) else None,
                         "cache": "hit",
-                    })
+                    }
+                    if _opt_notes or _opt_warnings:
+                        _hit_timing["query_opt"] = {"notes": _opt_notes, "warnings": _opt_warnings}
+                    self._captured_timings.append(_hit_timing)
                     return cached
                 self._consume_query_quota(query)
                 result = self._call_with_timeout(query, args, kwargs)
@@ -425,14 +452,17 @@ class QueryCapturingClientWrapper:
                 span.set_attribute("datasource.result_bytes", result_bytes)
                 span.set_attribute("datasource.cache", "miss")
                 self._cache_put(query, result, _q_ms)
-                self._captured_timings.append({
+                _miss_timing = {
                     "index": idx,
                     "query_ms": round(_q_ms, 1),
                     "rows": rows,
                     "result_bytes": result_bytes,
                     "sql": query[:500] if isinstance(query, str) else None,
                     "cache": "miss",
-                })
+                }
+                if _opt_notes or _opt_warnings:
+                    _miss_timing["query_opt"] = {"notes": _opt_notes, "warnings": _opt_warnings}
+                self._captured_timings.append(_miss_timing)
                 return result
             except QueryTimeoutError as e:
                 _q_ms = (_time.monotonic() - _q_start) * 1000.0
@@ -469,6 +499,7 @@ class QueryCapturingClientWrapper:
         Result sizing uses the on-disk Parquet size and a lazy row count rather
         than materializing the frame.
         """
+        query, _, _ = self._maybe_optimize(query)
         if isinstance(query, str):
             self._captured_queries.append(query)
         idx = len(self._captured_timings)
