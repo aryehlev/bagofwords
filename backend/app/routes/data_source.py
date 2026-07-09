@@ -89,10 +89,10 @@ async def get_data_source(
 
 
 @router.post("/data_sources/{data_source_id}/profile", response_model=dict)
-@requires_resource_permission('data_source', 'view')
+@requires_resource_permission('data_source', 'manage')
 async def profile_data_source_endpoint(
     data_source_id: str,
-    table_limit: Optional[int] = None,
+    table_limit: Optional[int] = Query(None, ge=1, description="Profile at most this many tables per connection"),
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(current_user),
     organization: Organization = Depends(get_current_organization),

@@ -90,7 +90,11 @@ class TestGetOAuthParams:
         )
         params = get_oauth_params(conn)
         assert params["provider_name"] == "microsoft"
-        assert "api.fabric.microsoft.com" in params["scopes"]
+        # Fabric SQL endpoints authenticate with Azure SQL tokens
+        # (aud=database.windows.net), not Fabric API tokens — see
+        # connection_oauth_service scopes_map.
+        assert "database.windows.net/user_impersonation" in params["scopes"]
+        assert "offline_access" in params["scopes"]
 
     def test_bigquery(self):
         conn = _make_connection(

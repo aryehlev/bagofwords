@@ -7,7 +7,7 @@ query timings. Advisory only — consumed by the coder prompt and the SQL
 optimizer; never required for execution. See docs/design/query-intelligence.md.
 
 Revision ID: qryintel01
-Revises: ff8803de3eb2
+Revises: mrgperf01
 Create Date: 2026-06-25
 """
 from typing import Sequence, Union
@@ -16,7 +16,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision: str = "qryintel01"
-down_revision: Union[str, None] = "ff8803de3eb2"
+down_revision: Union[str, None] = "mrgperf01"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -27,7 +27,7 @@ def upgrade() -> None:
         sa.Column("connection_id", sa.String(length=36), nullable=False),
         sa.Column("connection_table_id", sa.String(length=36), nullable=True),
         sa.Column("table_fqn", sa.String(), nullable=False),
-        sa.Column("row_count_estimate", sa.Integer(), nullable=True),
+        sa.Column("row_count_estimate", sa.BigInteger(), nullable=True),
         sa.Column("sample_rows", sa.Integer(), nullable=False),
         sa.Column("column_profiles", sa.JSON(), nullable=False),
         sa.Column("value_dictionaries", sa.JSON(), nullable=False),

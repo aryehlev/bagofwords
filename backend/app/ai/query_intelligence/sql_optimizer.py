@@ -194,14 +194,50 @@ def lint_sql(
 # Rewrites
 # --------------------------------------------------------------------------- #
 
+# Aggregate functions whose result depends on input row order. If any of these
+# appear in the query, a subquery's ORDER BY may be feeding them (e.g.
+# ``SELECT array_agg(x) FROM (SELECT x FROM t ORDER BY x) s``) — stripping it
+# would change the result, so we don't touch ordering anywhere in that tree.
+_ORDER_SENSITIVE_FUNCS = frozenset({
+    # normalized: lowercased, underscores removed — matches both SQL spellings
+    # ("array_agg") and sqlglot expression keys ("arrayagg").
+    "arrayagg", "stringagg", "groupconcat", "listagg", "collectlist",
+    "arrayconcatagg", "jsonagg", "jsonbagg", "jsonarrayagg",
+    "first", "last", "firstvalue", "lastvalue", "anyvalue",
+})
+
+
+def _normalize_func_name(name: str) -> str:
+    return str(name).strip().lower().replace("_", "").replace(" ", "")
+
+
+def _has_order_sensitive_calls(tree: "exp.Expression") -> bool:
+    for func in tree.find_all(exp.Func):
+        # Anonymous funcs carry the name as written; typed funcs are identified
+        # by their expression key (lowercase class name, e.g. ArrayAgg -> arrayagg).
+        name = func.name if isinstance(func, exp.Anonymous) else func.key
+        if name and _normalize_func_name(name) in _ORDER_SENSITIVE_FUNCS:
+            return True
+    return False
+
+
 def _strip_pointless_order_by(tree: "exp.Expression") -> bool:
     """Remove ORDER BY from any non-root SELECT that has no LIMIT/OFFSET.
 
     Standard SQL gives no ordering guarantee to a subquery's rows unless paired
     with a row-limiting clause, so the ORDER BY there is dead work the engine may
-    even be forced to honor. Dropping it cannot change the final result set.
+    even be forced to honor. Dropping it cannot change the final result set —
+    with two exceptions we conservatively respect:
+
+      * an order-sensitive aggregate anywhere in the query (array_agg,
+        string_agg, group_concat, ...) may consume the subquery's ordering;
+      * a DISTINCT subquery (Postgres ``DISTINCT ON`` picks which row survives
+        based on ORDER BY).
+
     Returns True if anything was removed.
     """
+    if _has_order_sensitive_calls(tree):
+        return False
     removed = False
     for select in tree.find_all(exp.Select):
         if select is tree:
@@ -211,6 +247,8 @@ def _strip_pointless_order_by(tree: "exp.Expression") -> bool:
             continue
         if select.args.get("limit") is not None or select.args.get("offset") is not None:
             continue  # ORDER BY + LIMIT is meaningful — keep it
+        if select.args.get("distinct") is not None:
+            continue  # DISTINCT ON depends on ORDER BY to pick the kept row
         select.set("order", None)
         removed = True
     return removed

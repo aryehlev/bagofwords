@@ -60,7 +60,11 @@ Only two transforms touch the SQL, both conservative:
 
 * **Drop pointless ORDER BY** — an `ORDER BY` in a non-root subquery with no
   `LIMIT`/`OFFSET` has no defined effect on the final result; removing it is
-  provably semantics-preserving. Always safe.
+  semantics-preserving. Two cases are conservatively left untouched: queries
+  containing an order-sensitive aggregate anywhere (`array_agg`, `string_agg`,
+  `group_concat`, `listagg`, …), whose result can legally depend on the
+  subquery's ordering, and `DISTINCT` subqueries (Postgres `DISTINCT ON`
+  picks the surviving row by `ORDER BY`).
 * **Safety LIMIT** (guardrail, gated by `BOW_QUERY_INTEL_SAFETY_LIMIT`) — caps an
   unbounded, non-aggregating top-level `SELECT`. This *does* change behavior (it
   truncates), so it lives behind its own flag and is skipped for queries that

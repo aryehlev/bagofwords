@@ -174,4 +174,9 @@ def attribute_costs_to_tables(
             continue
         for table in extract_tables(sql, dialect):
             per_table.setdefault(table, []).append(t)
-    return {tbl: summarize_timings(ts) for tbl, ts in per_table.items() if summarize_timings(ts)}
+    out: dict[str, dict] = {}
+    for tbl, ts in per_table.items():
+        summary = summarize_timings(ts)
+        if summary:
+            out[tbl] = summary
+    return out

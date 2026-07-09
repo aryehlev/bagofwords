@@ -79,6 +79,20 @@ def test_attribute_costs_to_tables_groups_by_table():
     assert by_table["orders"]["avg_query_ms"] == 1000
 
 
+def test_merge_with_cache_hit_only_observation_keeps_history():
+    # A run whose queries were all cache hits summarizes to observations=0 with
+    # only last_query_ms — merging it must not erase the learned averages.
+    prev = {"observations": 3, "avg_query_ms": 500.0, "p95_query_ms": 800.0, "max_query_ms": 900.0, "last_query_ms": 500.0}
+    obs = {"observations": 0, "avg_query_ms": None, "p95_query_ms": None, "max_query_ms": None, "last_query_ms": 2.0}
+    merged = cr.merge_cost_summary(prev, obs, slow_query_ms=4000)
+    assert merged["observations"] == 3
+    assert merged["avg_query_ms"] == 500.0
+    assert merged["p95_query_ms"] == 800.0
+    assert merged["max_query_ms"] == 900.0
+    assert merged["last_query_ms"] == 2.0
+    assert merged["slow"] is False
+
+
 def test_attribute_costs_falls_back_to_executed_queries_positionally():
     executed = ["SELECT * FROM orders"]
     timings = [{"index": 0, "query_ms": 300, "rows": 1, "cache": "miss"}]  # no 'sql' key

@@ -499,7 +499,7 @@ class QueryCapturingClientWrapper:
         Result sizing uses the on-disk Parquet size and a lazy row count rather
         than materializing the frame.
         """
-        query, _, _ = self._maybe_optimize(query)
+        query, _opt_notes, _opt_warnings = self._maybe_optimize(query)
         if isinstance(query, str):
             self._captured_queries.append(query)
         idx = len(self._captured_timings)
@@ -519,7 +519,7 @@ class QueryCapturingClientWrapper:
                     self._consume_data_bytes_quota(query, result_bytes, None)
                     span.set_attribute("datasource.cache", "hit")
                     span.set_attribute("datasource.result_bytes", result_bytes)
-                    self._captured_timings.append({
+                    _hit_timing = {
                         "index": idx,
                         "query_ms": round(_q_ms, 1),
                         "rows": None,
@@ -527,7 +527,10 @@ class QueryCapturingClientWrapper:
                         "sql": query[:500] if isinstance(query, str) else None,
                         "cache": "hit",
                         "lazy": True,
-                    })
+                    }
+                    if _opt_notes or _opt_warnings:
+                        _hit_timing["query_opt"] = {"notes": _opt_notes, "warnings": _opt_warnings}
+                    self._captured_timings.append(_hit_timing)
                     return cached
                 self._consume_query_quota(query)
                 result = self._call_with_timeout(query, args, kwargs, method_name="execute_query_lazy")
@@ -543,7 +546,7 @@ class QueryCapturingClientWrapper:
                 span.set_attribute("datasource.result_bytes", result_bytes)
                 span.set_attribute("datasource.cache", "miss")
                 self._cache_put_lazy(query, result, _q_ms)
-                self._captured_timings.append({
+                _miss_timing = {
                     "index": idx,
                     "query_ms": round(_q_ms, 1),
                     "rows": rows,
@@ -551,7 +554,10 @@ class QueryCapturingClientWrapper:
                     "sql": query[:500] if isinstance(query, str) else None,
                     "cache": "miss",
                     "lazy": True,
-                })
+                }
+                if _opt_notes or _opt_warnings:
+                    _miss_timing["query_opt"] = {"notes": _opt_notes, "warnings": _opt_warnings}
+                self._captured_timings.append(_miss_timing)
                 return result
             except QueryTimeoutError as e:
                 _q_ms = (_time.monotonic() - _q_start) * 1000.0

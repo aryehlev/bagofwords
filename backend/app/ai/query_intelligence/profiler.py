@@ -284,6 +284,12 @@ class DataProfiler:
             row_count_estimate=row_count,
             config=self.cfg,
         )
+        # Guard: on very large tables a bounded sample cannot be trusted to have
+        # observed every category, so a value dictionary would produce
+        # false-positive "matches no observed value" lints. Keep the stats,
+        # drop the dictionaries.
+        if row_count is not None and row_count > self.cfg.profile_max_table_rows:
+            payload["value_dictionaries"] = {}
         partial = sample.empty or (want_count and row_count is None)
         payload["status"] = "partial" if partial else "ok"
         payload["profiled_at"] = datetime.now(timezone.utc)

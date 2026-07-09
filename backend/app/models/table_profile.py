@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, ForeignKey, JSON, Integer, DateTime, Index
+from sqlalchemy import Column, String, ForeignKey, JSON, Integer, BigInteger, DateTime, Index
 from sqlalchemy.orm import relationship
 
 from app.models.base import BaseSchema
@@ -38,7 +38,8 @@ class TableProfile(BaseSchema):
     table_fqn = Column(String, nullable=False)
 
     # Best-effort row count from the sampling pass (COUNT(*) or an approx).
-    row_count_estimate = Column(Integer, nullable=True)
+    # BigInteger: real warehouse tables routinely exceed the int32 range.
+    row_count_estimate = Column(BigInteger, nullable=True)
     # Number of rows actually sampled to derive the column stats below.
     sample_rows = Column(Integer, nullable=False, default=0)
 

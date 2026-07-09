@@ -111,6 +111,20 @@ def test_data_profiler_profile_table_end_to_end():
     assert any("count(" in q.lower() for q in client.queries)
 
 
+def test_data_profiler_drops_value_dicts_for_huge_tables():
+    # A bounded sample of a huge table can't enumerate every category — keeping
+    # the dictionary would cause false-positive "unknown literal" lints.
+    sample = pd.DataFrame({"status": ["a", "b", "a"], "id": [1, 2, 3]})
+    client = _FakeClient(sample, count=1_000_000)
+    profiler = pf.DataProfiler(_cfg(profile_max_table_rows=500_000))
+    payload = profiler.profile_table(client, "orders", columns_meta=[{"name": "status", "dtype": "varchar"}], dialect="postgres")
+    assert payload is not None
+    assert payload["row_count_estimate"] == 1_000_000
+    assert payload["value_dictionaries"] == {}
+    # Column stats survive — only the dictionaries are dropped.
+    assert "status" in payload["column_profiles"]
+
+
 def test_data_profiler_handles_sample_failure():
     class _Boom:
         def execute_query(self, sql):

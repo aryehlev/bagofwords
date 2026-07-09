@@ -79,6 +79,32 @@ def test_outer_order_by_is_never_removed():
     assert "order by" in res.sql.lower()
 
 
+@pytest.mark.parametrize(
+    "agg",
+    ["array_agg(x)", "string_agg(x, ',')", "group_concat(x)", "listagg(x)", "json_agg(x)"],
+)
+def test_order_by_kept_when_order_sensitive_aggregate_consumes_it(agg):
+    # e.g. SELECT array_agg(x) FROM (SELECT x FROM t ORDER BY x) s — the
+    # subquery's ordering feeds the aggregate; stripping it changes the result.
+    sql = f"SELECT {agg} FROM (SELECT x FROM t ORDER BY x) s"
+    res = so.optimize_sql(sql, source_type="postgresql", config=_cfg(safety_limit_enabled=False))
+    assert "order by" in res.sql.lower()
+    assert not res.changed
+
+
+def test_order_by_kept_in_distinct_subquery():
+    # Postgres DISTINCT ON picks the surviving row based on ORDER BY.
+    sql = "SELECT * FROM (SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC) s"
+    res = so.optimize_sql(sql, source_type="postgresql", config=_cfg(safety_limit_enabled=False))
+    assert "order by" in res.sql.lower()
+
+
+def test_order_by_still_stripped_with_order_insensitive_aggregate():
+    sql = "SELECT count(*) FROM (SELECT x FROM t ORDER BY x) s"
+    res = so.optimize_sql(sql, source_type="postgresql", config=_cfg(safety_limit_enabled=False))
+    assert "order by" not in res.sql.lower()
+
+
 def test_rewrite_disabled_returns_original_sql():
     res = so.optimize_sql(
         "SELECT id FROM orders",
